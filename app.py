@@ -25,7 +25,8 @@ class WaterSystemExplorer:
         self.db_path = db_path
         self.health_info = self._init_health_info()
         self.violation_explanations = self._init_violation_explanations()
-        self.azure_client = self._init_azure_openai()
+        self.azure_client = self._init_azure_openai("high")
+        self.azure_client_low = self._init_azure_openai("low")
     
     def get_connection(self):
         """Get database connection"""
@@ -80,13 +81,18 @@ class WaterSystemExplorer:
             'RPT': 'Reporting - Required reports were not submitted'
         }
     
-    def _init_azure_openai(self):
+    def _init_azure_openai(self, model_type: str="high"):
         """Initialize Azure OpenAI client"""
         try:
             # Fall back to environment variables
-            api_key = os.getenv('AZURE_OPENAI_API_KEY')
-            endpoint = os.getenv('AZURE_OPENAI_ENDPOINT')
-            api_version = os.getenv('AZURE_OPENAI_API_VERSION', '2024-02-15-preview')
+            if model_type == "high":
+                api_key = os.getenv('AZURE_OPENAI_API_KEY')
+                endpoint = os.getenv('AZURE_OPENAI_ENDPOINT')
+                api_version = os.getenv('AZURE_OPENAI_API_VERSION', '2024-02-15-preview')
+            else:
+                api_key = os.getenv('AZURE_OPENAI_API_KEY_2')
+                endpoint = os.getenv('AZURE_OPENAI_ENDPOINT_2')
+                api_version = os.getenv('AZURE_OPENAI_API_VERSION_2', '2024-02-15-preview')
             
             if not api_key or not endpoint:
                 st.warning("⚠️ Azure OpenAI configuration not found. AI summaries will use default text.")
