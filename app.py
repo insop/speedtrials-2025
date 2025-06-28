@@ -3,6 +3,12 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 from datetime import datetime
+import os
+from openai import AzureOpenAI
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Page configuration
 st.set_page_config(
@@ -19,6 +25,7 @@ class WaterSystemExplorer:
         self.db_path = db_path
         self.health_info = self._init_health_info()
         self.violation_explanations = self._init_violation_explanations()
+        self.azure_client = self._init_azure_openai()
     
     def get_connection(self):
         """Get database connection"""
@@ -73,6 +80,33 @@ class WaterSystemExplorer:
             'RPT': 'Reporting - Required reports were not submitted'
         }
     
+    def _init_azure_openai(self):
+        """Initialize Azure OpenAI client"""
+        try:
+            # Try to get configuration from Streamlit secrets first
+            if hasattr(st, 'secrets') and 'azure_openai' in st.secrets:
+                api_key = st.secrets.azure_openai.api_key
+                endpoint = st.secrets.azure_openai.endpoint
+                api_version = st.secrets.azure_openai.get('api_version', '2024-02-15-preview')
+            else:
+                # Fall back to environment variables
+                api_key = os.getenv('AZURE_OPENAI_API_KEY')
+                endpoint = os.getenv('AZURE_OPENAI_ENDPOINT')
+                api_version = os.getenv('AZURE_OPENAI_API_VERSION', '2024-02-15-preview')
+            
+            if not api_key or not endpoint:
+                st.warning("⚠️ Azure OpenAI configuration not found. AI summaries will use default text.")
+                return None
+            
+            return AzureOpenAI(
+                api_key=api_key,
+                api_version=api_version,
+                azure_endpoint=endpoint
+            )
+        except Exception as e:
+            st.warning(f"⚠️ Failed to initialize Azure OpenAI: {str(e)}. Using default summaries.")
+            return None
+    
     def find_water_systems(self, search_term):
         """Find water systems by search term"""
         query = """
@@ -121,6 +155,119 @@ class WaterSystemExplorer:
         for key, query in queries.items():
             results[key] = self.execute_query(query, {'pwsid': pwsid})
         return results
+    
+    def _generate_summary(self, safety_data, system_info):
+        """Generate a summary of the water system's safety status"""
+        violations_df = safety_data['recent_violations']
+        test_results_df = safety_data['test_results']
+        
+        # Count violations
+        total_violations = len(violations_df)
+        health_violations = len(violations_df[violations_df['IS_HEALTH_BASED_IND'] == 'Y']) if not violations_df.empty else 0
+        unresolved_health = len(violations_df[
+            (violations_df['IS_HEALTH_BASED_IND'] == 'Y') & 
+            (violations_df['VIOLATION_STATUS'].isin(['Unaddressed', 'Addressed']))
+        ]) if not violations_df.empty else 0
+        
+        # Generate population info
+        population = int(system_info.get('POPULATION_SERVED_COUNT', 0))
+        pop_text = f"{population:,} people" if population > 0 else "unknown number of people"
+        
+        # Generate fallback summary text
+        if unresolved_health > 0:
+            fallback_summary = f"⚠️ **ATTENTION REQUIRED**: This water system serving {pop_text} currently has {unresolved_health} active health-based violation(s). Immediate action may be needed to ensure water safety."
+        elif health_violations > 0:
+            fallback_summary = f"📋 This water system serving {pop_text} has had {health_violations} health-based violation(s) in the past 2 years, but they appear to be resolved. Monitor for updates."
+        elif total_violations > 0:
+            fallback_summary = f"✅ This water system serving {pop_text} has good health compliance but has {total_violations} non-health monitoring/reporting violation(s) in the past 2 years."
+        else:
+            fallback_summary = f"✅ **GOOD NEWS**: This water system serving {pop_text} has no violations in the past 2 years and appears to be operating safely."
+        
+        # Add test results info if available
+        if not test_results_df.empty:
+            unique_contaminants = len(test_results_df['CONTAMINANT_CODE'].unique())
+            fallback_summary += f" Recent testing covers {unique_contaminants} different contaminant(s)."
+        
+        # If Azure OpenAI is not available, return fallback summary
+        if not self.azure_client:
+            print("Azure OpenAI not available, returning fallback summary.")
+            return fallback_summary
+        
+        print("Generating summary...")
+        try:
+            # Prepare data for AI analysis
+            violations_summary = []
+            if not violations_df.empty:
+                for _, violation in violations_df.iterrows():
+                    violations_summary.append({
+                        'type': violation['VIOLATION_CATEGORY_CODE'],
+                        'contaminant': violation['CONTAMINANT_CODE'],
+                        'health_based': violation['IS_HEALTH_BASED_IND'] == 'Y',
+                        'status': violation.get('VIOLATION_STATUS', 'Unknown'),
+                        'start_date': violation.get('NON_COMPL_PER_BEGIN_DATE'),
+                        'end_date': violation.get('NON_COMPL_PER_END_DATE')
+                    })
+            
+            test_summary = []
+            if not test_results_df.empty:
+                for _, test in test_results_df.iterrows():
+                    test_summary.append({
+                        'contaminant': test['CONTAMINANT_CODE'],
+                        'result': test['SAMPLE_MEASURE'],
+                        'unit': test.get('UNIT_OF_MEASURE', ''),
+                        'date': test['SAMPLING_END_DATE']
+                    })
+            
+            # Create the AI prompt
+            prompt = f"""You are a water safety expert analyzing data for a public water system. Generate a clear, informative summary that the general public can understand.
+
+Water System Information:
+- Population served: {pop_text}
+- Total violations (last 2 years): {total_violations}
+- Health-based violations: {health_violations}
+- Unresolved health violations: {unresolved_health}
+
+Violations Details: {violations_summary[:5]}  # Limit to first 5 for context
+Test Results: {test_summary[:5]}  # Limit to first 5 for context
+
+Requirements:
+1. Start with an appropriate emoji and status (⚠️ for urgent attention, 📋 for monitoring needed, ✅ for good status)
+2. Write in plain language that non-experts can understand
+3. Be factual and balanced - neither alarmist nor dismissive  
+4. Include specific numbers when relevant
+5. Keep it to 2-3 sentences maximum
+6. Focus on what matters most to public safety
+
+Generate a summary suitable for display to residents served by this water system."""
+
+            # Get deployment name from configuration
+            if hasattr(st, 'secrets') and 'azure_openai' in st.secrets:
+                deployment_name = st.secrets.azure_openai.get('deployment_name', 'gpt-4')
+            else:
+                deployment_name = os.getenv('AZURE_OPENAI_DEPLOYMENT_NAME', 'gpt-4')
+            
+            # Make the API call
+            response = self.azure_client.chat.completions.create(
+                model=deployment_name,
+                messages=[
+                    {"role": "system", "content": "You are a water safety expert who explains technical information clearly to the general public."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=2000,
+                temperature=0.3
+            )
+            
+            ai_summary = response.choices[0].message.content.strip()
+            
+            # Validate the response is reasonable
+            if ai_summary and len(ai_summary) > 20:
+                return ai_summary
+            else:
+                return fallback_summary
+                
+        except Exception as e:
+            st.warning(f"⚠️ AI summary generation failed: {str(e)}. Using default summary.")
+            return fallback_summary
 
 class UIComponents:
     """UI component handlers"""
@@ -142,7 +289,6 @@ class UIComponents:
                 explorer, 
                 st.session_state.selected_system['pwsid'], 
                 st.session_state.selected_system['name'],
-                summary_txt="This is a summary of the safety report"
             )
             
             # Add button to clear the report
@@ -235,7 +381,7 @@ class SafetyReportGenerator:
         
         # Generate and show summary section
         if summary_txt is None:
-            summary_txt = SafetyReportGenerator._generate_summary(safety_data, system_info)
+            summary_txt = explorer._generate_summary(safety_data, system_info)
         
         SafetyReportGenerator._show_summary_section(summary_txt, safety_data, system_info)
         
@@ -417,41 +563,6 @@ class SafetyReportGenerator:
         st.write("• Georgia EPD: 1-888-373-5947")
         st.write("• EPA Safe Drinking Water Hotline: 1-800-426-4791")
         st.write(f"• Your Water System: {system_info.get('PHONE_NUMBER', 'Contact information not available')}")
-    
-    @staticmethod
-    def _generate_summary(safety_data, system_info):
-        """Generate a summary of the water system's safety status"""
-        violations_df = safety_data['recent_violations']
-        test_results_df = safety_data['test_results']
-        
-        # Count violations
-        total_violations = len(violations_df)
-        health_violations = len(violations_df[violations_df['IS_HEALTH_BASED_IND'] == 'Y']) if not violations_df.empty else 0
-        unresolved_health = len(violations_df[
-            (violations_df['IS_HEALTH_BASED_IND'] == 'Y') & 
-            (violations_df['VIOLATION_STATUS'].isin(['Unaddressed', 'Addressed']))
-        ]) if not violations_df.empty else 0
-        
-        # Generate population info
-        population = int(system_info.get('POPULATION_SERVED_COUNT', 0))
-        pop_text = f"{population:,} people" if population > 0 else "unknown number of people"
-        
-        # Generate summary text
-        if unresolved_health > 0:
-            summary = f"⚠️ **ATTENTION REQUIRED**: This water system serving {pop_text} currently has {unresolved_health} active health-based violation(s). Immediate action may be needed to ensure water safety."
-        elif health_violations > 0:
-            summary = f"📋 This water system serving {pop_text} has had {health_violations} health-based violation(s) in the past 2 years, but they appear to be resolved. Monitor for updates."
-        elif total_violations > 0:
-            summary = f"✅ This water system serving {pop_text} has good health compliance but has {total_violations} non-health monitoring/reporting violation(s) in the past 2 years."
-        else:
-            summary = f"✅ **GOOD NEWS**: This water system serving {pop_text} has no violations in the past 2 years and appears to be operating safely."
-        
-        # Add test results info if available
-        if not test_results_df.empty:
-            unique_contaminants = len(test_results_df['CONTAMINANT_CODE'].unique())
-            summary += f" Recent testing covers {unique_contaminants} different contaminant(s)."
-        
-        return summary
     
     @staticmethod
     def _show_summary_section(summary_txt, safety_data, system_info):

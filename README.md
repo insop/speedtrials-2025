@@ -36,6 +36,40 @@ The Georgia RFP wants solutions for three primary stakeholders:
    - You can build for the Public, the Operators, the Regulators (or all three!).
 1. **Submit:** Instructions below.
 
+## 🤖 AI-Powered Summaries
+
+This application includes Azure OpenAI integration to generate intelligent, contextual summaries of water system safety data. The AI analyzes violations, test results, and system information to provide clear, public-friendly explanations.
+
+### Setting up Azure OpenAI
+
+1. **Option 1: Streamlit Secrets** (Recommended)
+   - Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml`
+   - Fill in your Azure OpenAI credentials:
+     ```toml
+     [azure_openai]
+     api_key = "your-azure-openai-api-key"
+     endpoint = "https://your-resource-name.openai.azure.com/"
+     api_version = "2024-02-15-preview"
+     deployment_name = "gpt-4"
+     ```
+
+2. **Option 2: Environment Variables**
+   ```bash
+   export AZURE_OPENAI_API_KEY="your-api-key"
+   export AZURE_OPENAI_ENDPOINT="https://your-resource-name.openai.azure.com/"
+   export AZURE_OPENAI_API_VERSION="2024-02-15-preview"
+   export AZURE_OPENAI_DEPLOYMENT_NAME="gpt-4"
+   ```
+
+3. **Without Azure OpenAI**: The app will gracefully fall back to pre-written summaries if no AI configuration is provided.
+
+### Installation
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
 ## Implementation Requirements
 
 - **Don't sweat hosting:** You can build the whole thing locally and share a live link via [ngrok tunnel](https://ngrok.com/our-product/secure-tunnels) (or similar) to your localhost:
