@@ -83,16 +83,10 @@ class WaterSystemExplorer:
     def _init_azure_openai(self):
         """Initialize Azure OpenAI client"""
         try:
-            # Try to get configuration from Streamlit secrets first
-            if hasattr(st, 'secrets') and 'azure_openai' in st.secrets:
-                api_key = st.secrets.azure_openai.api_key
-                endpoint = st.secrets.azure_openai.endpoint
-                api_version = st.secrets.azure_openai.get('api_version', '2024-02-15-preview')
-            else:
-                # Fall back to environment variables
-                api_key = os.getenv('AZURE_OPENAI_API_KEY')
-                endpoint = os.getenv('AZURE_OPENAI_ENDPOINT')
-                api_version = os.getenv('AZURE_OPENAI_API_VERSION', '2024-02-15-preview')
+            # Fall back to environment variables
+            api_key = os.getenv('AZURE_OPENAI_API_KEY')
+            endpoint = os.getenv('AZURE_OPENAI_ENDPOINT')
+            api_version = os.getenv('AZURE_OPENAI_API_VERSION', '2024-02-15-preview')
             
             if not api_key or not endpoint:
                 st.warning("⚠️ Azure OpenAI configuration not found. AI summaries will use default text.")
@@ -241,10 +235,7 @@ Requirements:
 Generate a summary suitable for display to residents served by this water system."""
 
             # Get deployment name from configuration
-            if hasattr(st, 'secrets') and 'azure_openai' in st.secrets:
-                deployment_name = st.secrets.azure_openai.get('deployment_name', 'gpt-4')
-            else:
-                deployment_name = os.getenv('AZURE_OPENAI_DEPLOYMENT_NAME', 'gpt-4')
+            deployment_name = os.getenv('AZURE_OPENAI_DEPLOYMENT_NAME', 'gpt-4')
             
             # Make the API call
             response = self.azure_client.chat.completions.create(
@@ -253,8 +244,8 @@ Generate a summary suitable for display to residents served by this water system
                     {"role": "system", "content": "You are a water safety expert who explains technical information clearly to the general public."},
                     {"role": "user", "content": prompt}
                 ],
-                max_tokens=2000,
-                temperature=0.3
+                max_completion_tokens=2000,
+                # temperature=0.3
             )
             
             ai_summary = response.choices[0].message.content.strip()
