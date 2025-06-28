@@ -275,16 +275,13 @@ def show_public_interface(explorer):
     # Check if we should show a safety report
     if st.session_state.show_safety_report and st.session_state.selected_pwsid:
         # Display safety report
-        col1, col2 = st.columns([1, 4])
-        with col1:
-            if st.button("← Back to Search", type="secondary"):
-                st.session_state.show_safety_report = False
-                st.session_state.selected_pwsid = None
-                st.session_state.selected_system_name = None
-                st.rerun()
-        
-        show_water_safety_report(explorer, st.session_state.selected_pwsid, st.session_state.selected_system_name)
-        return  # Don't show the rest of the interface when displaying safety report
+        if st.button("← Back to Search", type="secondary"):
+            st.session_state.show_safety_report = False
+            st.session_state.selected_pwsid = None
+            st.session_state.selected_system_name = None
+        else:
+            show_water_safety_report(explorer, st.session_state.selected_pwsid, st.session_state.selected_system_name)
+            return  # Don't show the rest of the interface when displaying safety report
     
     # Water system finder
     st.subheader("🔍 Find Your Water System")
@@ -319,31 +316,54 @@ def show_public_interface(explorer):
                             st.session_state.show_safety_report = True
                             st.session_state.selected_pwsid = system['PWSID']
                             st.session_state.selected_system_name = system['PWS_NAME']
-                            st.experimental_rerun()
+                            st.success(f"Loading safety report for {system['PWS_NAME']}...")
+                            st.info("Please wait, retrieving data...")
+                            # Immediately show the report without rerun
+                            show_water_safety_report(explorer, system['PWSID'], system['PWS_NAME'])
+                            return
         else:
             st.warning("No water systems found. Try a different search term.")
     
-    # Educational content
-    st.subheader("📚 Understanding Your Water Quality")
-    
-    tab1, tab2, tab3 = st.tabs(["Common Contaminants", "Violation Types", "What You Can Do"])
-    
-    with tab1:
-        show_contaminant_education(explorer)
-    
-    with tab2:
-        show_violation_education(explorer)
-    
-    with tab3:
-        show_action_guidance()
+    # Show helpful tip at the bottom
+    if not st.session_state.show_safety_report:
+        st.info("💡 **Tip:** Search for your city, county, zip code, or water system name above to find your local water system and view its safety report.")
 
 def show_water_safety_report(explorer, pwsid, system_name):
     st.subheader(f"🛡️ Water Safety Report: {system_name}")
+    st.write(f"**PWSID:** {pwsid}")
     
-    safety_data = explorer.get_system_safety_summary(pwsid)
+    # Add debug information
+    with st.expander("🔧 Debug Information", expanded=False):
+        st.write(f"Searching for PWSID: {pwsid}")
+        st.write(f"System Name: {system_name}")
     
+    # Get safety data with error handling
+    try:
+        safety_data = explorer.get_system_safety_summary(pwsid)
+        st.success("✅ Data retrieved successfully")
+        
+        # Debug: Show what data was retrieved
+        with st.expander("📊 Retrieved Data Summary", expanded=False):
+            st.write(f"Basic Info Records: {len(safety_data['basic_info'])}")
+            st.write(f"Violations Records: {len(safety_data['recent_violations'])}")
+            st.write(f"Test Results Records: {len(safety_data['latest_test_results'])}")
+            
+            if not safety_data['basic_info'].empty:
+                st.write("**Basic Info Columns:**", list(safety_data['basic_info'].columns))
+            if not safety_data['recent_violations'].empty:
+                st.write("**Violations Columns:**", list(safety_data['recent_violations'].columns))
+    
+    except Exception as e:
+        st.error(f"Error retrieving data: {str(e)}")
+        return
+    
+    # Check if system exists
     if safety_data['basic_info'].empty:
-        st.error("System information not found.")
+        st.error("❌ System information not found in database.")
+        st.info("This could mean:")
+        st.write("• The PWSID doesn't exist in the database")
+        st.write("• The system is inactive")
+        st.write("• There's a data synchronization issue")
         return
     
     system_info = safety_data['basic_info'].iloc[0]
@@ -352,59 +372,149 @@ def show_water_safety_report(explorer, pwsid, system_name):
     recent_violations = safety_data['recent_violations']
     health_violations = recent_violations[recent_violations['IS_HEALTH_BASED_IND'] == 'Y'] if not recent_violations.empty else pd.DataFrame()
     
+    # Overall safety status
+    st.subheader("🏥 Safety Status")
     if health_violations.empty:
-        st.success("✅ No recent health-based violations found")
+        st.success("✅ No recent health-based violations found (last 2 years)")
         safety_color = "green"
     else:
         unresolved_health = health_violations[health_violations['VIOLATION_STATUS'].isin(['Unaddressed', 'Addressed'])]
         if not unresolved_health.empty:
-            st.error("⚠️ Active health-based violations found")
+            st.error("⚠️ Active health-based violations found - Contact your water system immediately")
             safety_color = "red"
         else:
-            st.warning("⚡ Recent health-based violations (resolved)")
+            st.warning("⚡ Recent health-based violations found (resolved)")
             safety_color = "orange"
     
     # System details
+    st.subheader("🏢 System Information")
     col1, col2 = st.columns(2)
     
     with col1:
-        st.write("**System Information:**")
-        st.write(f"• Type: {get_system_type_description(system_info['PWS_TYPE_CODE'])}")
-        st.write(f"• Population Served: {system_info['POPULATION_SERVED_COUNT']:,.0f}")
-        st.write(f"• Water Source: {get_source_description(system_info['PRIMARY_SOURCE_CODE'])}")
-        st.write(f"• Contact: {system_info['PHONE_NUMBER']}")
+        st.write("**Basic Details:**")
+        st.write(f"• **Name:** {system_info.get('PWS_NAME', 'Not Available')}")
+        st.write(f"• **Type:** {get_system_type_description(system_info.get('PWS_TYPE_CODE', 'Unknown'))}")
+        st.write(f"• **Population Served:** {system_info.get('POPULATION_SERVED_COUNT', 0):,.0f} people")
+        st.write(f"• **Water Source:** {get_source_description(system_info.get('PRIMARY_SOURCE_CODE', 'Unknown'))}")
+        st.write(f"• **Location:** {system_info.get('CITY_NAME', 'Not Available')}")
     
     with col2:
-        st.write("**Recent Activity:**")
+        st.write("**Contact & Activity:**")
+        st.write(f"• **Phone:** {system_info.get('PHONE_NUMBER', 'Not Available')}")
         if not recent_violations.empty:
-            st.write(f"• Total violations (2 years): {len(recent_violations)}")
-            st.write(f"• Health-based violations: {len(health_violations)}")
+            st.write(f"• **Total violations (2 years):** {len(recent_violations)}")
+            st.write(f"• **Health-based violations:** {len(health_violations)}")
         else:
-            st.write("• No recent violations")
+            st.write("• **Violations:** No recent violations found")
+    
+    # Latest test results
+    test_results = safety_data['latest_test_results']
+    if not test_results.empty:
+        st.subheader("🧪 Latest Test Results")
+        
+        # Group by contaminant
+        contaminants = test_results['CONTAMINANT_CODE'].unique()
+        
+        for contaminant in contaminants[:5]:  # Show top 5 contaminants
+            contaminant_tests = test_results[test_results['CONTAMINANT_CODE'] == contaminant].head(3)
+            
+            with st.expander(f"🔬 {contaminant} Test Results"):
+                for idx, test in contaminant_tests.iterrows():
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.write(f"**Date:** {test['SAMPLING_END_DATE']}")
+                        st.write(f"**Result:** {test.get('RESULT_SIGN_CODE', '')}{test['SAMPLE_MEASURE']} {test.get('UNIT_OF_MEASURE', '')}")
+                    
+                    with col2:
+                        # Show health information if available
+                        contaminant_info = explorer.get_contaminant_health_info().get(contaminant)
+                        if contaminant_info:
+                            st.write(f"**Action Level:** {contaminant_info['action_level']}")
+                            st.write(f"**Health Risk:** {contaminant_info['severity']}")
+    else:
+        st.info("🧪 No recent test results available in database")
     
     # Recent violations details
     if not recent_violations.empty:
-        st.subheader("Recent Violations (Last 2 Years)")
+        st.subheader("⚠️ Violations & Issues (Last 2 Years)")
         
-        for idx, violation in recent_violations.iterrows():
-            severity = "🔴" if violation['IS_HEALTH_BASED_IND'] == 'Y' else "🟡"
-            status_color = "red" if violation['VIOLATION_STATUS'] in ['Unaddressed', 'Addressed'] else "green"
+        # Group violations by health impact
+        health_violations_list = recent_violations[recent_violations['IS_HEALTH_BASED_IND'] == 'Y']
+        other_violations = recent_violations[recent_violations['IS_HEALTH_BASED_IND'] != 'Y']
+        
+        # Show health-based violations first
+        if not health_violations_list.empty:
+            st.error("🚨 Health-Based Violations (Immediate Attention Required)")
             
-            with st.expander(f"{severity} {violation['VIOLATION_CATEGORY_CODE']} - {violation['CONTAMINANT_CODE']} ({violation['VIOLATION_STATUS']})"):
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.write(f"**Started:** {violation['NON_COMPL_PER_BEGIN_DATE']}")
-                    if violation['NON_COMPL_PER_END_DATE']:
-                        st.write(f"**Resolved:** {violation['NON_COMPL_PER_END_DATE']}")
-                    st.write(f"**Status:** {violation['VIOLATION_STATUS']}")
-                
-                with col2:
-                    # Show health information if available
-                    contaminant_info = explorer.get_contaminant_health_info().get(violation['CONTAMINANT_CODE'])
-                    if contaminant_info:
-                        st.write(f"**Health Effects:** {contaminant_info['health_effects']}")
-                        st.write(f"**Severity:** {contaminant_info['severity']}")
+            for idx, violation in health_violations_list.iterrows():
+                with st.expander(f"🔴 {violation['VIOLATION_CATEGORY_CODE']} - {violation['CONTAMINANT_CODE']} ({violation.get('VIOLATION_STATUS', 'Unknown Status')})", expanded=True):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.write(f"**Started:** {violation.get('NON_COMPL_PER_BEGIN_DATE', 'Unknown')}")
+                        if violation.get('NON_COMPL_PER_END_DATE'):
+                            st.write(f"**Resolved:** {violation['NON_COMPL_PER_END_DATE']}")
+                        st.write(f"**Status:** {violation.get('VIOLATION_STATUS', 'Unknown')}")
+                        st.write(f"**Violation Type:** {violation.get('VIOLATION_CATEGORY_CODE', 'Unknown')}")
+                    
+                    with col2:
+                        # Show health information if available
+                        contaminant_info = explorer.get_contaminant_health_info().get(violation['CONTAMINANT_CODE'])
+                        if contaminant_info:
+                            st.error(f"**Health Effects:** {contaminant_info['health_effects']}")
+                            st.write(f"**Common Sources:** {contaminant_info['sources']}")
+                            st.write(f"**Action Level:** {contaminant_info['action_level']}")
+                            st.write(f"**Risk Level:** {contaminant_info['severity']}")
+                        else:
+                            st.write("**Health Impact:** This is a health-based violation")
+                        
+                        # Get violation type explanation
+                        violation_explanation = explorer.get_violation_explanations().get(violation['VIOLATION_CATEGORY_CODE'])
+                        if violation_explanation:
+                            st.info(f"**What this means:** {violation_explanation}")
+        
+        # Show other violations
+        if not other_violations.empty:
+            st.warning("📋 Other Violations (Monitoring & Reporting)")
+            
+            for idx, violation in other_violations.iterrows():
+                with st.expander(f"🟡 {violation['VIOLATION_CATEGORY_CODE']} - {violation['CONTAMINANT_CODE']} ({violation.get('VIOLATION_STATUS', 'Unknown Status')})"):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.write(f"**Started:** {violation.get('NON_COMPL_PER_BEGIN_DATE', 'Unknown')}")
+                        if violation.get('NON_COMPL_PER_END_DATE'):
+                            st.write(f"**Resolved:** {violation['NON_COMPL_PER_END_DATE']}")
+                        st.write(f"**Status:** {violation.get('VIOLATION_STATUS', 'Unknown')}")
+                    
+                    with col2:
+                        # Get violation type explanation
+                        violation_explanation = explorer.get_violation_explanations().get(violation['VIOLATION_CATEGORY_CODE'])
+                        if violation_explanation:
+                            st.info(f"**What this means:** {violation_explanation}")
+    else:
+        st.success("🎉 No violations found in the last 2 years!")
+    
+    # Action recommendations
+    st.subheader("📞 What You Should Do")
+    
+    if not health_violations.empty:
+        st.error("**Immediate Actions Required:**")
+        st.write("• Contact your water system immediately for current status")
+        st.write("• Ask about corrective measures being taken")
+        st.write("• Consider using bottled water until resolved")
+        st.write("• Sign up for system notifications")
+    else:
+        st.success("**Stay Informed:**")
+        st.write("• Review your annual water quality report")
+        st.write("• Sign up for system notifications")
+        st.write("• Contact your system with any concerns")
+    
+    # Emergency contacts
+    st.info("**Emergency Contacts:**")
+    st.write("• Georgia EPD: 1-888-373-5947")
+    st.write("• EPA Safe Drinking Water Hotline: 1-800-426-4791")
+    st.write(f"• Your Water System: {system_info.get('PHONE_NUMBER', 'Contact information not available')}")
 
 def show_operator_interface(explorer):
     st.header("🔧 Water System Operator Dashboard")
