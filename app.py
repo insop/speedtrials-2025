@@ -69,21 +69,57 @@ Database Schema:
 
 Natural Language Query: """ + natural_language_query + """
 
+CRITICAL: Your query MUST return results that include water system information for proper display. 
+For queries about water systems, violations, or test results, ALWAYS include these core columns from pub_water_systems:
+- p.PWSID
+- p.PWS_NAME  
+- p.PWS_TYPE_CODE
+- p.POPULATION_SERVED_COUNT
+- p.CITY_NAME
+
+And when possible, also include:
+- g.COUNTY_SERVED 
+- g.ZIP_CODE_SERVED (from geographic_areas table)
+
 Generate a SQL query that answers the user's question. The query should:
 1. Be safe and read-only (SELECT statements only)
 2. Use proper JOIN statements when needed
-3. Include relevant columns for water safety analysis
+3. ALWAYS include the core water system columns listed above for proper UI display
 4. Limit results to a reasonable number (e.g., LIMIT 100)
-5. Return results that can be displayed in a water safety context
-6. Use proper SQLite syntax and functions
+5. Use proper SQLite syntax and functions
+6. Filter for active systems: p.PWS_ACTIVITY_CODE = 'A'
 
 Important tables and their relationships:
 - pub_water_systems (p): Basic water system information (PWSID is primary key)
-- violations_enforcement (v): Violation records (linked by PWSID)
-- lcr_samples (l): Test results (linked by PWSID)
-- geographic_areas (g): Location information (linked by PWSID)
+- violations_enforcement (v): Violation records (linked by PWSID) - contains IS_HEALTH_BASED_IND, VIOLATION_CATEGORY_CODE, CONTAMINANT_CODE, VIOLATION_STATUS
+- lcr_samples (l): Lead/Copper test results (linked by PWSID) - contains SAMPLE_MEASURE, CONTAMINANT_CODE
+- geographic_areas (g): Location information (linked by PWSID) - contains COUNTY_SERVED, CITY_SERVED, ZIP_CODE_SERVED
 
-Common patterns and example queries to reference:
+Key Violation Categories for Water Quality Analysis:
+- MCL: Maximum Contaminant Level violations (health-based)
+- MRDL: Maximum Residual Disinfectant Level violations (health-based) 
+- TT: Treatment Technique violations (health-based)
+- MON: Monitoring violations (non-health-based)
+- RPT: Reporting violations (non-health-based)
+
+"Bad water quality" indicators:
+- Health-based violations: IS_HEALTH_BASED_IND = 'Y'
+- Unresolved violations: VIOLATION_STATUS IN ('Unaddressed', 'Addressed')
+- High-risk contaminants: CONTAMINANT_CODE IN ('LEAD', 'COPPER', 'COLIFORM', 'NITRATE', 'ARSENIC')
+- Recent violations: NON_COMPL_PER_BEGIN_DATE >= date('now', '-2 years')
+
+REQUIRED OUTPUT FORMAT - Always start with these columns:
+SELECT DISTINCT p.PWSID, p.PWS_NAME, p.PWS_TYPE_CODE, p.POPULATION_SERVED_COUNT,
+       p.CITY_NAME, g.COUNTY_SERVED, g.ZIP_CODE_SERVED
+       [additional columns as needed for the specific query]
+FROM pub_water_systems p
+LEFT JOIN geographic_areas g ON p.PWSID = g.PWSID
+[additional JOINs as needed]
+WHERE p.PWS_ACTIVITY_CODE = 'A' AND [your specific conditions]
+ORDER BY [appropriate ordering - often by violation count DESC or population DESC]
+LIMIT 100;
+
+Example queries for reference:
 
 1. Find water systems by location:
 SELECT DISTINCT p.PWSID, p.PWS_NAME, p.PWS_TYPE_CODE, p.POPULATION_SERVED_COUNT,
@@ -97,26 +133,72 @@ WHERE p.PWS_ACTIVITY_CODE = 'A' AND (
 )
 ORDER BY p.POPULATION_SERVED_COUNT DESC;
 
-2. Get violations for analysis:
-SELECT p.PWS_NAME, p.CITY_NAME, v.VIOLATION_CATEGORY_CODE, v.CONTAMINANT_CODE,
-       v.NON_COMPL_PER_BEGIN_DATE, v.IS_HEALTH_BASED_IND, v.VIOLATION_STATUS
-FROM violations_enforcement v
-JOIN pub_water_systems p ON v.PWSID = p.PWSID
-WHERE v.NON_COMPL_PER_BEGIN_DATE >= date('now', '-2 years')
-ORDER BY v.NON_COMPL_PER_BEGIN_DATE DESC;
+2. Find water systems with health violations (bad water quality):
+SELECT DISTINCT p.PWSID, p.PWS_NAME, p.PWS_TYPE_CODE, p.POPULATION_SERVED_COUNT,
+       p.CITY_NAME, g.COUNTY_SERVED, g.ZIP_CODE_SERVED,
+       v.VIOLATION_CATEGORY_CODE, v.CONTAMINANT_CODE, v.VIOLATION_STATUS,
+       COUNT(v.VIOLATION_ID) as violation_count
+FROM pub_water_systems p
+LEFT JOIN geographic_areas g ON p.PWSID = g.PWSID
+JOIN violations_enforcement v ON p.PWSID = v.PWSID
+WHERE p.PWS_ACTIVITY_CODE = 'A' 
+  AND v.IS_HEALTH_BASED_IND = 'Y'
+  AND v.NON_COMPL_PER_BEGIN_DATE >= date('now', '-2 years')
+GROUP BY p.PWSID, p.PWS_NAME, p.PWS_TYPE_CODE, p.POPULATION_SERVED_COUNT,
+         p.CITY_NAME, g.COUNTY_SERVED, g.ZIP_CODE_SERVED,
+         v.VIOLATION_CATEGORY_CODE, v.CONTAMINANT_CODE, v.VIOLATION_STATUS
+ORDER BY violation_count DESC, p.POPULATION_SERVED_COUNT DESC
+LIMIT 100;
 
-3. Get test results:
-SELECT p.PWS_NAME, p.CITY_NAME, l.CONTAMINANT_CODE, l.SAMPLE_MEASURE, 
-       l.UNIT_OF_MEASURE, l.SAMPLING_END_DATE
-FROM lcr_samples l
-JOIN pub_water_systems p ON l.PWSID = p.PWSID
-ORDER BY l.SAMPLING_END_DATE DESC
-LIMIT 50;
+3. Find counties with bad water quality (county-level analysis):
+SELECT DISTINCT p.PWSID, p.PWS_NAME, p.PWS_TYPE_CODE, p.POPULATION_SERVED_COUNT,
+       p.CITY_NAME, g.COUNTY_SERVED, g.ZIP_CODE_SERVED,
+       COUNT(CASE WHEN v.IS_HEALTH_BASED_IND = 'Y' THEN 1 END) as health_violations,
+       COUNT(v.VIOLATION_ID) as total_violations
+FROM pub_water_systems p
+LEFT JOIN geographic_areas g ON p.PWSID = g.PWSID
+LEFT JOIN violations_enforcement v ON p.PWSID = v.PWSID 
+  AND v.NON_COMPL_PER_BEGIN_DATE >= date('now', '-2 years')
+WHERE p.PWS_ACTIVITY_CODE = 'A' AND g.COUNTY_SERVED IS NOT NULL
+GROUP BY p.PWSID, p.PWS_NAME, p.PWS_TYPE_CODE, p.POPULATION_SERVED_COUNT,
+         p.CITY_NAME, g.COUNTY_SERVED, g.ZIP_CODE_SERVED
+HAVING health_violations > 0
+ORDER BY health_violations DESC, total_violations DESC
+LIMIT 100;
+
+4. Find systems with lead/copper issues:
+SELECT DISTINCT p.PWSID, p.PWS_NAME, p.PWS_TYPE_CODE, p.POPULATION_SERVED_COUNT,
+       p.CITY_NAME, g.COUNTY_SERVED, g.ZIP_CODE_SERVED,
+       l.CONTAMINANT_CODE, l.SAMPLE_MEASURE, l.UNIT_OF_MEASURE, l.SAMPLING_END_DATE
+FROM pub_water_systems p
+LEFT JOIN geographic_areas g ON p.PWSID = g.PWSID
+JOIN lcr_samples l ON p.PWSID = l.PWSID
+WHERE p.PWS_ACTIVITY_CODE = 'A'
+  AND l.CONTAMINANT_CODE IN ('LEAD', 'COPPER')
+  AND l.SAMPLING_END_DATE >= date('now', '-2 years')
+ORDER BY l.SAMPLE_MEASURE DESC, p.POPULATION_SERVED_COUNT DESC
+LIMIT 100;
+
+5. Find systems with unresolved violations:
+SELECT DISTINCT p.PWSID, p.PWS_NAME, p.PWS_TYPE_CODE, p.POPULATION_SERVED_COUNT,
+       p.CITY_NAME, g.COUNTY_SERVED, g.ZIP_CODE_SERVED,
+       v.VIOLATION_CATEGORY_CODE, v.CONTAMINANT_CODE, v.VIOLATION_STATUS,
+       v.NON_COMPL_PER_BEGIN_DATE
+FROM pub_water_systems p
+LEFT JOIN geographic_areas g ON p.PWSID = g.PWSID
+JOIN violations_enforcement v ON p.PWSID = v.PWSID
+WHERE p.PWS_ACTIVITY_CODE = 'A'
+  AND v.VIOLATION_STATUS IN ('Unaddressed', 'Addressed')
+  AND v.IS_HEALTH_BASED_IND = 'Y'
+ORDER BY v.NON_COMPL_PER_BEGIN_DATE DESC, p.POPULATION_SERVED_COUNT DESC
+LIMIT 100;
 
 Key field values to remember:
 - PWS_ACTIVITY_CODE = 'A' for active systems
-- IS_HEALTH_BASED_IND = 'Y' for health-based violations
-- Common CONTAMINANT_CODEs: LEAD, COPPER, COLIFORM, NITRATE
+- IS_HEALTH_BASED_IND = 'Y' for health-based violations (MCL, MRDL, TT)
+- VIOLATION_STATUS: 'Resolved', 'Archived', 'Addressed', 'Unaddressed'
+- VIOLATION_CATEGORY_CODE: 'MCL', 'MRDL', 'TT' (health-based), 'MON', 'RPT' (non-health)
+- Common CONTAMINANT_CODEs: 'LEAD', 'COPPER', 'COLIFORM', 'NITRATE', 'ARSENIC', 'RADIUM'
 - Date functions: date('now', '-2 years') for recent data
 
 Return ONLY the SQL query without any explanation, formatting, or code blocks."""
