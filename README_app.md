@@ -1,17 +1,14 @@
 # README APP
 
-Our water quality assistant help Georgia residents to find out the safety of their drinking water.
+Our water quality assistant helps Georgia residents find out the safety of their drinking water.
 
+## Main Components:
 
-## Main components:
+1. **Natural Language Query Processing**
+   - We take natural language questions and parse them using LLM.
+   - For simple queries like "how's quality of atlanta?", we use existing query patterns.
+   - For complex queries like "water quality population over 2000?", we generate SQL queries using LLM.
 
-1. User ask natural language question
-- We take the natural language question and parse it using LLM.
-
-For example, if the query is "how's quality of atlanta?", then we can use exiting query.
-
-Or, we can ask "water quality population over 2000?" then we generate SQL query using LLM.
-
-2. Summarize the result in natural language
-
-- We combine query results and use LLM to summarize the results so that users can easily find out the safety without going through the long results
+2. **Intelligent Result Summarization**
+   - We combine query results and use LLM to summarize the findings in natural language.
+   - This allows users to easily understand water safety without navigating through lengthy technical results.
