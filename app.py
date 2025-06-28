@@ -4,6 +4,7 @@ import pandas as pd
 import sqlite3
 from datetime import datetime
 import os
+import json
 from openai import AzureOpenAI
 
 from dotenv import load_dotenv
@@ -40,6 +41,89 @@ class WaterSystemExplorer:
         except Exception as e:
             st.error(f"Database error: {str(e)}")
             return pd.DataFrame()
+    
+    def execute_generated_query(self, query):
+        """Execute a generated SQL query and return results"""
+        try:
+            with self.get_connection() as conn:
+                return pd.read_sql_query(query, conn)
+        except Exception as e:
+            st.error(f"Query execution error: {str(e)}")
+            return pd.DataFrame()
+    
+    def generate_sql_query(self, natural_language_query):
+        """Generate SQL query from natural language using AI"""
+        if not self.azure_client_low:
+            st.error("AI service not available for query generation")
+            return None
+        
+        try:
+            # Get database schema information
+            schema_info = self._get_database_schema()
+            
+            prompt = f"""You are a SQL expert specializing in water safety data analysis.
+            
+Database Schema:
+{schema_info}
+
+Natural Language Query: {natural_language_query}
+
+Generate a SQL query that answers the user's question. The query should:
+1. Be safe and read-only (SELECT statements only)
+2. Use proper JOIN statements when needed
+3. Include relevant columns for water safety analysis
+4. Limit results to a reasonable number (e.g., LIMIT 100)
+5. Return results that can be displayed in a water safety context
+
+Important tables:
+- pub_water_systems: Basic water system information
+- violations_enforcement: Violation records
+- lcr_samples: Test results
+- geographic_areas: Location information
+
+Return ONLY the SQL query without any explanation or formatting."""
+
+            response = self.azure_client_low.chat.completions.create(
+                model=os.getenv('AZURE_OPENAI_DEPLOYMENT_NAME_2'),
+                messages=[
+                    {"role": "system", "content": "You are a SQL expert who generates safe, read-only queries for water safety data analysis."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_completion_tokens=1000,
+                temperature=0.1
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            st.error(f"Failed to generate SQL query: {str(e)}")
+            return None
+    
+    def _get_database_schema(self):
+        """Get basic database schema information"""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                
+                # Get table names
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                tables = cursor.fetchall()
+                
+                schema_info = "Database Tables and Key Columns:\n\n"
+                
+                for table in tables:
+                    table_name = table[0]
+                    cursor.execute(f"PRAGMA table_info({table_name})")
+                    columns = cursor.fetchall()
+                    
+                    schema_info += f"{table_name}:\n"
+                    for col in columns[:10]:  # Limit to first 10 columns
+                        schema_info += f"  - {col[1]} ({col[2]})\n"
+                    schema_info += "\n"
+                
+                return schema_info
+        except Exception as e:
+            return f"Error getting schema: {str(e)}"
     
     def _init_health_info(self):
         """Initialize contaminant health information"""
@@ -300,8 +384,8 @@ class UIComponents:
         
         with col1:
             search_input = st.text_input(
-                "Enter your city, county, zip code, or water system name:",
-                placeholder="e.g., Atlanta, Fulton County, 30309, or City of Atlanta",
+                "Enter your question regarding water safety:",
+                placeholder="e.g., Atlanta, or what is the water quality in Atlanta?",
                 key="search_input"
             )
         
@@ -310,15 +394,73 @@ class UIComponents:
         
         # Handle search
         if search_button and search_input:
-            st.session_state.search_results = explorer.find_water_systems(search_input)
+            with st.spinner("Processing your query..."):
+                # Determine query type using AI
+                prompt = f"""
+                You are a water safety expert.
+                You need to determine the type of the question. If the query is only about a specific location then return the query_type as "location" For the query_type is location, return the exact location as a 'query' instead of the original question. If the query is not about a specific location and requires complex analysis, then return the query_type as "query".
+                
+                Question: {search_input}
+                
+                Return the query_type and the processed query in the following format:
+                {{
+                    "query_type": "location" | "query",
+                    "query": "processed_query_here"
+                }}
+                """
+
+                if explorer.azure_client_low:
+                    try:
+                        response = explorer.azure_client_low.chat.completions.create(
+                            model=os.getenv('AZURE_OPENAI_DEPLOYMENT_NAME_2'),
+                            messages=[
+                                {"role": "system", "content": "You are a water safety expert who analyzes queries and determines their type."},
+                                {"role": "user", "content": prompt}
+                            ],
+                            max_completion_tokens=500,
+                            temperature=0.1
+                        )
+                        
+                        query_type, processed_query = _parse_response_for_query_type_and_query(response)
+                        print("parsed response")
+                        print(query_type)
+                        print(processed_query)
+                        
+                        if query_type == "location":
+                            # Use the processed query or fall back to original input
+                            search_term = processed_query if processed_query else search_input
+                            st.session_state.search_results = explorer.find_water_systems(search_term)
+                            print("location query")
+                            print(search_term)
+                        elif query_type == "query":
+                            # Generate and execute SQL query
+                            sql_query = explorer.generate_sql_query(search_input)
+                            if sql_query:
+                                st.info(f"Generated SQL query: {sql_query[:200]}...")
+                                query_results = explorer.execute_generated_query(sql_query)
+                                st.session_state.search_results = query_results
+                            else:
+                                st.error("Failed to generate SQL query for your question.")
+                                st.session_state.search_results = pd.DataFrame()
+                            print("query query")
+                            print(sql_query)
+                            print(query_results)
+                        
+                    except Exception as e:
+                        st.error(f"Error processing query: {str(e)}")
+                        # Fall back to simple location search
+                        st.session_state.search_results = explorer.find_water_systems(search_input)
+                else:
+                    # Fall back to simple location search when AI is not available
+                    st.session_state.search_results = explorer.find_water_systems(search_input)
         
         # Display search results
         if not st.session_state.search_results.empty:
             UIComponents._show_search_results(st.session_state.search_results)
         elif search_button and search_input:
-            st.warning("No water systems found. Try a different search term.")
+            st.warning("No results found. Try a different search term or question.")
         else:
-            st.info("💡 **Tip:** Search for your city, county, zip code, or water system name to find your local water system and view its safety report.")
+            st.info("💡 **Tip:** Ask questions like 'What is the water quality in Atlanta?' or search for your city, county, zip code, or water system name.")
     
     @staticmethod
     def _show_search_results(systems_df):
@@ -628,6 +770,39 @@ class DataFormatters:
             'GUP': 'Purchased Groundwater Under Surface Water Influence'
         }
         return descriptions.get(code, code)
+
+def _parse_response_for_query_type_and_query(response):
+    """Parse Azure OpenAI response to extract query_type and query"""
+    try:
+        content = response.choices[0].message.content.strip()
+        
+        # Try to parse as JSON
+        try:
+            data = json.loads(content)
+            return data.get('query_type', 'location'), data.get('query', '')
+        except json.JSONDecodeError:
+            # If not valid JSON, try to extract from text
+            lines = content.split('\n')
+            query_type = 'location'
+            query = ''
+            
+            for line in lines:
+                if 'query_type' in line.lower():
+                    if 'query' in line.lower() and 'location' not in line.lower():
+                        query_type = 'query'
+                    else:
+                        query_type = 'location'
+                elif 'query' in line.lower() and '"' in line:
+                    # Extract query from quoted text
+                    parts = line.split('"')
+                    if len(parts) >= 2:
+                        query = parts[1]
+            
+            return query_type, query
+            
+    except Exception as e:
+        st.warning(f"Failed to parse AI response: {str(e)}")
+        return 'location', ''
 
 def main():
     """Main application entry point"""
