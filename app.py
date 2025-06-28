@@ -124,14 +124,22 @@ Return ONLY the SQL query without any explanation, formatting, or code blocks.""
             response = self.azure_client_low.chat.completions.create(
                 model=os.getenv('AZURE_OPENAI_DEPLOYMENT_NAME_2'),
                 messages=[
-                    {"role": "system", "content": "You are a SQL expert who generates safe, read-only queries for water safety data analysis."},
+                    {"role": "system", "content": "You are a SQL expert who generates safe, read-only queries for water safety data analysis. Always return clean SQL without formatting."},
                     {"role": "user", "content": prompt}
                 ],
                 max_completion_tokens=1000,
                 temperature=0.1
             )
             
-            return response.choices[0].message.content.strip()
+            generated_query = response.choices[0].message.content.strip()
+            
+            # Clean up the response - remove any markdown formatting
+            if generated_query.startswith('```sql'):
+                generated_query = generated_query.replace('```sql', '').replace('```', '')
+            elif generated_query.startswith('```'):
+                generated_query = generated_query.replace('```', '')
+            
+            return generated_query.strip()
             
         except Exception as e:
             st.error(f"Failed to generate SQL query: {str(e)}")
@@ -504,21 +512,67 @@ class UIComponents:
     @staticmethod
     def _show_search_results(systems_df):
         """Display search results"""
-        st.success(f"Found {len(systems_df)} water system(s) in your area:")
+        st.success(f"Found {len(systems_df)} result(s):")
         
+        # Check if this is a standard water system search or a general query result
+        is_standard_search = all(col in systems_df.columns for col in ['PWS_NAME', 'PWSID'])
+        
+        if is_standard_search:
+            # Standard water system search results
+            UIComponents._show_standard_search_results(systems_df)
+        else:
+            # General query results - display as a table
+            UIComponents._show_general_query_results(systems_df)
+    
+    @staticmethod
+    def _show_standard_search_results(systems_df):
+        """Display standard water system search results"""
         for idx, system in systems_df.iterrows():
-            with st.expander(f"🏢 {system['PWS_NAME']} (PWSID: {system['PWSID']})"):
+            system_name = system.get('PWS_NAME', 'Unknown System')
+            pwsid = system.get('PWSID', 'Unknown')
+            
+            with st.expander(f"🏢 {system_name} (PWSID: {pwsid})"):
                 UIComponents._show_system_preview(system)
                 
-                # Use a unique key for each button
-                button_key = f"safety_{system['PWSID']}"
-                if st.button(f"📊 View Safety Report", key=button_key, type="primary"):
-                    # Store selected system in session state
-                    st.session_state.selected_system = {
-                        'pwsid': system['PWSID'],
-                        'name': system['PWS_NAME']
-                    }
-                    st.rerun()
+                # Only show the safety report button if we have a valid PWSID
+                if pwsid != 'Unknown':
+                    button_key = f"safety_{pwsid}"
+                    if st.button(f"📊 View Safety Report", key=button_key, type="primary"):
+                        # Store selected system in session state
+                        st.session_state.selected_system = {
+                            'pwsid': pwsid,
+                            'name': system_name
+                        }
+                        st.rerun()
+    
+    @staticmethod
+    def _show_general_query_results(systems_df):
+        """Display general query results as a table"""
+        st.info("📊 Query Results:")
+        
+        # Display the dataframe
+        st.dataframe(systems_df, use_container_width=True)
+        
+        # Check if we can identify water systems from the results
+        potential_pwsid_cols = [col for col in systems_df.columns if 'PWSID' in col.upper()]
+        potential_name_cols = [col for col in systems_df.columns if 'NAME' in col.upper()]
+        
+        if potential_pwsid_cols and potential_name_cols:
+            st.info("💡 **Tip:** If you see water systems in the results above, you can search for them by name to get a detailed safety report.")
+            
+            # Show a few examples of systems that could be searched
+            pwsid_col = potential_pwsid_cols[0]
+            name_col = potential_name_cols[0]
+            
+            unique_systems = systems_df[[pwsid_col, name_col]].drop_duplicates().head(3)
+            
+            if not unique_systems.empty:
+                st.write("**Examples you can search for:**")
+                for _, system in unique_systems.iterrows():
+                    system_name = system.get(name_col, 'Unknown')
+                    pwsid = system.get(pwsid_col, 'Unknown')
+                    if system_name != 'Unknown' and pwsid != 'Unknown':
+                        st.write(f"• {system_name} (PWSID: {pwsid})")
     
     @staticmethod
     def _show_system_preview(system):
@@ -526,13 +580,28 @@ class UIComponents:
         col1, col2 = st.columns(2)
         
         with col1:
-            st.write(f"**Type:** {DataFormatters.get_system_type_description(system['PWS_TYPE_CODE'])}")
-            st.write(f"**Serves:** {system['POPULATION_SERVED_COUNT']:,.0f} people")
+            # Handle PWS_TYPE_CODE
+            pws_type = system.get('PWS_TYPE_CODE', 'Unknown')
+            st.write(f"**Type:** {DataFormatters.get_system_type_description(pws_type)}")
+            
+            # Handle POPULATION_SERVED_COUNT
+            population = system.get('POPULATION_SERVED_COUNT', 0)
+            if population and pd.notna(population):
+                st.write(f"**Serves:** {population:,.0f} people")
+            else:
+                st.write("**Serves:** Population data not available")
         
         with col2:
-            st.write(f"**Location:** {system['CITY_NAME']}")
-            if pd.notna(system.get('COUNTY_SERVED')):
-                st.write(f"**County:** {system['COUNTY_SERVED']}")
+            # Handle CITY_NAME
+            city = system.get('CITY_NAME', 'Unknown')
+            st.write(f"**Location:** {city}")
+            
+            # Handle COUNTY_SERVED
+            county = system.get('COUNTY_SERVED')
+            if county and pd.notna(county):
+                st.write(f"**County:** {county}")
+            else:
+                st.write("**County:** Not available")
 
 class SafetyReportGenerator:
     """Generates water safety reports"""
