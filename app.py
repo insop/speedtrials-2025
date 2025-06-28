@@ -9,10 +9,11 @@ import folium
 from streamlit_folium import st_folium
 from datetime import datetime, timedelta
 import numpy as np
+import re
 
 # Page configuration
 st.set_page_config(
-    page_title="Georgia SDWIS Data Explorer",
+    page_title="Georgia Water Safety Explorer",
     page_icon="💧",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -27,362 +28,860 @@ class SDWISExplorer:
     
     def execute_query(self, query, params=None):
         """Execute a SQL query and return results as DataFrame"""
-        with self.get_connection() as conn:
-            return pd.read_sql_query(query, conn, params=params or {})
+        try:
+            with self.get_connection() as conn:
+                return pd.read_sql_query(query, conn, params=params or {})
+        except Exception as e:
+            st.error(f"Database query error: {str(e)}")
+            return pd.DataFrame()
     
-    def get_summary_stats(self):
-        """Get overall summary statistics"""
-        queries = {
-            'total_systems': "SELECT COUNT(DISTINCT PWSID) as count FROM pub_water_systems",
-            'total_violations': "SELECT COUNT(*) as count FROM violations_enforcement",
-            'active_systems': "SELECT COUNT(DISTINCT PWSID) as count FROM pub_water_systems WHERE PWS_ACTIVITY_CODE = 'A'",
-            'total_population': "SELECT SUM(POPULATION_SERVED_COUNT) as total FROM pub_water_systems WHERE PWS_ACTIVITY_CODE = 'A'"
+    # Health information mappings
+    def get_contaminant_health_info(self):
+        return {
+            'LEAD': {
+                'health_effects': 'Can cause developmental delays in children, kidney problems, and high blood pressure',
+                'sources': 'Lead pipes, faucets, and fixtures; solder',
+                'action_level': '15 ppb',
+                'severity': 'High'
+            },
+            'COPPER': {
+                'health_effects': 'Short-term exposure can cause gastrointestinal distress; long-term exposure can cause liver or kidney damage',
+                'sources': 'Copper pipes; erosion of natural deposits',
+                'action_level': '1.3 ppm',
+                'severity': 'Medium'
+            },
+            'COLIFORM': {
+                'health_effects': 'May indicate presence of harmful bacteria, viruses, or parasites',
+                'sources': 'Human and animal fecal waste',
+                'action_level': '0 positive samples',
+                'severity': 'High'
+            },
+            'NITRATE': {
+                'health_effects': 'Can cause blue baby syndrome in infants under 6 months',
+                'sources': 'Fertilizer runoff, septic systems, erosion of natural deposits',
+                'action_level': '10 ppm',
+                'severity': 'High'
+            }
         }
-        
-        stats = {}
-        for key, query in queries.items():
-            result = self.execute_query(query)
-            stats[key] = result.iloc[0, 0] if not result.empty else 0
-        
-        return stats
     
-    def get_systems_by_type(self):
-        """Get water systems breakdown by type"""
+    def get_violation_explanations(self):
+        return {
+            'MCL': 'Maximum Contaminant Level - The highest level of a contaminant allowed in drinking water',
+            'MRDL': 'Maximum Residual Disinfectant Level - The highest level of disinfectant allowed',
+            'TT': 'Treatment Technique - Required processes to reduce contaminant levels',
+            'MR': 'Monitoring and Reporting - Required testing and reporting to ensure safety',
+            'MON': 'Monitoring - Required testing was not completed',
+            'RPT': 'Reporting - Required reports were not submitted'
+        }
+
+    # Public-facing queries
+    def find_my_water_system(self, address_input):
+        """Find water system by address, city, or zip code"""
         query = """
-        SELECT PWS_TYPE_CODE, COUNT(*) as count, 
-               SUM(POPULATION_SERVED_COUNT) as total_population
-        FROM pub_water_systems 
-        WHERE PWS_ACTIVITY_CODE = 'A'
-        GROUP BY PWS_TYPE_CODE
+        SELECT DISTINCT p.PWSID, p.PWS_NAME, p.PWS_TYPE_CODE, p.POPULATION_SERVED_COUNT,
+               p.CITY_NAME, g.COUNTY_SERVED, g.ZIP_CODE_SERVED
+        FROM pub_water_systems p
+        LEFT JOIN geographic_areas g ON p.PWSID = g.PWSID
+        WHERE p.PWS_ACTIVITY_CODE = 'A' AND (
+            UPPER(p.CITY_NAME) LIKE UPPER(:search) OR
+            UPPER(g.COUNTY_SERVED) LIKE UPPER(:search) OR
+            g.ZIP_CODE_SERVED LIKE :search OR
+            UPPER(p.PWS_NAME) LIKE UPPER(:search)
+        )
+        ORDER BY p.POPULATION_SERVED_COUNT DESC
         """
-        return self.execute_query(query)
+        return self.execute_query(query, {'search': f'%{address_input}%'})
     
-    def get_violations_by_type(self):
-        """Get violations breakdown by category"""
-        query = """
-        SELECT VIOLATION_CATEGORY_CODE, COUNT(*) as count
-        FROM violations_enforcement
-        GROUP BY VIOLATION_CATEGORY_CODE
-        ORDER BY count DESC
-        """
-        return self.execute_query(query)
-    
-    def get_violations_over_time(self):
-        """Get violations over time"""
-        query = """
-        SELECT DATE(NON_COMPL_PER_BEGIN_DATE) as violation_date, 
-               COUNT(*) as count,
-               VIOLATION_CATEGORY_CODE
-        FROM violations_enforcement
-        WHERE NON_COMPL_PER_BEGIN_DATE IS NOT NULL
-        GROUP BY DATE(NON_COMPL_PER_BEGIN_DATE), VIOLATION_CATEGORY_CODE
-        ORDER BY violation_date
-        """
-        return self.execute_query(query)
-    
-    def get_systems_by_county(self):
-        """Get systems by county"""
-        query = """
-        SELECT ga.COUNTY_SERVED, COUNT(DISTINCT ga.PWSID) as system_count,
-               AVG(pws.POPULATION_SERVED_COUNT) as avg_population
-        FROM geographic_areas ga
-        JOIN pub_water_systems pws ON ga.PWSID = pws.PWSID
-        WHERE ga.COUNTY_SERVED IS NOT NULL AND pws.PWS_ACTIVITY_CODE = 'A'
-        GROUP BY ga.COUNTY_SERVED
-        ORDER BY system_count DESC
-        """
-        return self.execute_query(query)
-    
-    def search_systems(self, search_term="", system_type="", min_population=0, max_population=1000000):
-        """Search water systems with filters"""
-        query = """
-        SELECT PWSID, PWS_NAME, PWS_TYPE_CODE, POPULATION_SERVED_COUNT,
-               CITY_NAME, STATE_CODE, PWS_ACTIVITY_CODE
-        FROM pub_water_systems
-        WHERE 1=1
-        """
-        params = {}
-        
-        if search_term:
-            query += " AND (PWS_NAME LIKE :search OR PWSID LIKE :search)"
-            params['search'] = f"%{search_term}%"
-        
-        if system_type:
-            query += " AND PWS_TYPE_CODE = :system_type"
-            params['system_type'] = system_type
-        
-        query += " AND POPULATION_SERVED_COUNT BETWEEN :min_pop AND :max_pop"
-        params['min_pop'] = min_population
-        params['max_pop'] = max_population
-        
-        query += " ORDER BY POPULATION_SERVED_COUNT DESC LIMIT 100"
-        
-        return self.execute_query(query, params)
-    
-    def get_system_details(self, pwsid):
-        """Get detailed information for a specific system"""
+    def get_system_safety_summary(self, pwsid):
+        """Get safety summary for public"""
         queries = {
             'basic_info': """
-                SELECT * FROM pub_water_systems WHERE PWSID = :pwsid
+                SELECT PWS_NAME, PWS_TYPE_CODE, POPULATION_SERVED_COUNT, 
+                       PRIMARY_SOURCE_CODE, CITY_NAME, PHONE_NUMBER
+                FROM pub_water_systems WHERE PWSID = :pwsid
             """,
-            'violations': """
-                SELECT * FROM violations_enforcement 
+            'recent_violations': """
+                SELECT VIOLATION_CATEGORY_CODE, CONTAMINANT_CODE, 
+                       NON_COMPL_PER_BEGIN_DATE, NON_COMPL_PER_END_DATE,
+                       VIOLATION_STATUS, IS_HEALTH_BASED_IND
+                FROM violations_enforcement 
                 WHERE PWSID = :pwsid 
+                AND NON_COMPL_PER_BEGIN_DATE >= date('now', '-2 years')
                 ORDER BY NON_COMPL_PER_BEGIN_DATE DESC
             """,
-            'facilities': """
-                SELECT * FROM facilities WHERE PWSID = :pwsid
-            """,
-            'site_visits': """
-                SELECT * FROM site_visits 
+            'latest_test_results': """
+                SELECT CONTAMINANT_CODE, SAMPLE_MEASURE, UNIT_OF_MEASURE,
+                       SAMPLING_END_DATE, RESULT_SIGN_CODE
+                FROM lcr_samples 
                 WHERE PWSID = :pwsid 
-                ORDER BY VISIT_DATE DESC
+                ORDER BY SAMPLING_END_DATE DESC
+                LIMIT 10
             """
         }
         
-        details = {}
+        results = {}
         for key, query in queries.items():
-            details[key] = self.execute_query(query, {'pwsid': pwsid})
+            results[key] = self.execute_query(query, {'pwsid': pwsid})
+        return results
+
+    # Operator-facing queries
+    def get_operator_dashboard(self, pwsid):
+        """Get operator dashboard data"""
+        queries = {
+            'system_info': """
+                SELECT * FROM pub_water_systems WHERE PWSID = :pwsid
+            """,
+            'active_violations': """
+                SELECT * FROM violations_enforcement 
+                WHERE PWSID = :pwsid AND VIOLATION_STATUS IN ('Unaddressed', 'Addressed')
+                ORDER BY NON_COMPL_PER_BEGIN_DATE DESC
+            """,
+            'upcoming_requirements': """
+                SELECT * FROM events_milestones 
+                WHERE PWSID = :pwsid 
+                AND EVENT_END_DATE >= date('now')
+                ORDER BY EVENT_END_DATE ASC
+            """,
+            'recent_inspections': """
+                SELECT * FROM site_visits 
+                WHERE PWSID = :pwsid 
+                ORDER BY VISIT_DATE DESC
+                LIMIT 5
+            """,
+            'facilities': """
+                SELECT * FROM facilities 
+                WHERE PWSID = :pwsid AND FACILITY_ACTIVITY_CODE = 'A'
+            """
+        }
         
-        return details
+        results = {}
+        for key, query in queries.items():
+            results[key] = self.execute_query(query, {'pwsid': pwsid})
+        return results
+    
+    def get_compliance_calendar(self, pwsid):
+        """Get compliance calendar for operators"""
+        query = """
+        SELECT EVENT_MILESTONE_CODE, EVENT_END_DATE, EVENT_COMMENTS_TEXT,
+               EVENT_REASON_CODE, EVENT_ACTUAL_DATE
+        FROM events_milestones 
+        WHERE PWSID = :pwsid 
+        AND EVENT_END_DATE >= date('now', '-6 months')
+        ORDER BY EVENT_END_DATE ASC
+        """
+        return self.execute_query(query, {'pwsid': pwsid})
+
+    # Regulator-facing queries
+    def get_regulator_field_kit(self, pwsid):
+        """Get quick field reference for regulators"""
+        queries = {
+            'system_snapshot': """
+                SELECT p.PWSID, p.PWS_NAME, p.PWS_TYPE_CODE, p.POPULATION_SERVED_COUNT,
+                       p.PRIMARY_SOURCE_CODE, p.OWNER_TYPE_CODE, p.SERVICE_CONNECTIONS_COUNT,
+                       p.CITY_NAME, p.PHONE_NUMBER, p.ADMIN_NAME
+                FROM pub_water_systems p WHERE p.PWSID = :pwsid
+            """,
+            'violation_summary': """
+                SELECT VIOLATION_CATEGORY_CODE, COUNT(*) as count,
+                       SUM(CASE WHEN IS_HEALTH_BASED_IND = 'Y' THEN 1 ELSE 0 END) as health_based_count,
+                       MAX(NON_COMPL_PER_BEGIN_DATE) as latest_violation
+                FROM violations_enforcement 
+                WHERE PWSID = :pwsid 
+                GROUP BY VIOLATION_CATEGORY_CODE
+            """,
+            'enforcement_history': """
+                SELECT ENFORCEMENT_ACTION_TYPE_CODE, ENFORCEMENT_DATE, 
+                       ENF_ACTION_CATEGORY
+                FROM violations_enforcement 
+                WHERE PWSID = :pwsid AND ENFORCEMENT_DATE IS NOT NULL
+                ORDER BY ENFORCEMENT_DATE DESC
+                LIMIT 10
+            """,
+            'inspection_history': """
+                SELECT VISIT_DATE, VISIT_REASON_CODE, COMPLIANCE_EVAL_CODE,
+                       TREATMENT_EVAL_CODE, DISTRIBUTION_EVAL_CODE
+                FROM site_visits 
+                WHERE PWSID = :pwsid 
+                ORDER BY VISIT_DATE DESC
+                LIMIT 5
+            """
+        }
+        
+        results = {}
+        for key, query in queries.items():
+            results[key] = self.execute_query(query, {'pwsid': pwsid})
+        return results
+    
+    def get_regional_overview(self, county=None):
+        """Get regional overview for regulators"""
+        base_query = """
+        SELECT p.PWSID, p.PWS_NAME, p.PWS_TYPE_CODE, p.POPULATION_SERVED_COUNT,
+               g.COUNTY_SERVED, 
+               COUNT(v.VIOLATION_ID) as total_violations,
+               SUM(CASE WHEN v.IS_HEALTH_BASED_IND = 'Y' THEN 1 ELSE 0 END) as health_violations,
+               MAX(sv.VISIT_DATE) as last_inspection
+        FROM pub_water_systems p
+        LEFT JOIN geographic_areas g ON p.PWSID = g.PWSID
+        LEFT JOIN violations_enforcement v ON p.PWSID = v.PWSID
+        LEFT JOIN site_visits sv ON p.PWSID = sv.PWSID
+        WHERE p.PWS_ACTIVITY_CODE = 'A'
+        """
+        
+        if county:
+            base_query += " AND UPPER(g.COUNTY_SERVED) = UPPER(:county)"
+            params = {'county': county}
+        else:
+            params = {}
+        
+        base_query += """
+        GROUP BY p.PWSID, p.PWS_NAME, p.PWS_TYPE_CODE, p.POPULATION_SERVED_COUNT, g.COUNTY_SERVED
+        ORDER BY total_violations DESC, p.POPULATION_SERVED_COUNT DESC
+        """
+        
+        return self.execute_query(base_query, params)
 
 def main():
-    st.title("🏛️ Georgia Safe Drinking Water Information System (SDWIS) Explorer")
-    st.markdown("### Explore public water system data, violations, and compliance for the state of Georgia")
+    st.title("🏛️ Georgia Water Safety Explorer")
     
     # Initialize the explorer
     explorer = SDWISExplorer()
     
-    # Sidebar navigation
-    st.sidebar.title("Navigation")
-    page = st.sidebar.selectbox(
-        "Choose a page:",
-        ["Dashboard", "System Search", "Violations Analysis", "Geographic View", "System Details"]
+    # Stakeholder selection
+    st.sidebar.title("👥 I am a...")
+    stakeholder = st.sidebar.selectbox(
+        "Select your role:",
+        ["Georgia Resident (Public)", "Water System Operator", "Regulator/Inspector"]
     )
     
-    if page == "Dashboard":
-        show_dashboard(explorer)
-    elif page == "System Search":
-        show_system_search(explorer)
-    elif page == "Violations Analysis":
-        show_violations_analysis(explorer)
-    elif page == "Geographic View":
-        show_geographic_view(explorer)
-    elif page == "System Details":
-        show_system_details(explorer)
+    if stakeholder == "Georgia Resident (Public)":
+        show_public_interface(explorer)
+    elif stakeholder == "Water System Operator":
+        show_operator_interface(explorer)
+    elif stakeholder == "Regulator/Inspector":
+        show_regulator_interface(explorer)
 
-def show_dashboard(explorer):
-    st.header("📊 Dashboard Overview")
+def show_public_interface(explorer):
+    st.header("💧 Is My Water Safe?")
+    st.markdown("### Find information about your local water system and understand your water quality")
     
-    # Get summary statistics
-    stats = explorer.get_summary_stats()
-    
-    # Display key metrics
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric("Total Water Systems", f"{stats['total_systems']:,}")
-    
-    with col2:
-        st.metric("Active Systems", f"{stats['active_systems']:,}")
-    
-    with col3:
-        st.metric("Total Violations", f"{stats['total_violations']:,}")
-    
-    with col4:
-        st.metric("Population Served", f"{stats['total_population']:,.0f}")
-    
-    # Charts
-    col1, col2 = st.columns(2)
+    # Water system finder
+    st.subheader("🔍 Find Your Water System")
+    col1, col2 = st.columns([3, 1])
     
     with col1:
-        st.subheader("Systems by Type")
-        systems_by_type = explorer.get_systems_by_type()
-        if not systems_by_type.empty:
-            fig = px.pie(systems_by_type, values='count', names='PWS_TYPE_CODE',
-                        title="Distribution of Water System Types")
-            st.plotly_chart(fig, use_container_width=True)
+        search_input = st.text_input(
+            "Enter your city, county, zip code, or water system name:",
+            placeholder="e.g., Atlanta, Fulton County, 30309, or City of Atlanta"
+        )
     
     with col2:
-        st.subheader("Violations by Category")
-        violations_by_type = explorer.get_violations_by_type()
-        if not violations_by_type.empty:
-            fig = px.bar(violations_by_type, x='VIOLATION_CATEGORY_CODE', y='count',
-                        title="Violations by Category")
-            st.plotly_chart(fig, use_container_width=True)
+        search_button = st.button("Find My Water System", type="primary")
     
-    # Violations over time
-    st.subheader("Violations Over Time")
-    violations_time = explorer.get_violations_over_time()
-    if not violations_time.empty:
-        violations_time['violation_date'] = pd.to_datetime(violations_time['violation_date'])
-        fig = px.line(violations_time, x='violation_date', y='count', 
-                     color='VIOLATION_CATEGORY_CODE',
-                     title="Violations Over Time by Category")
-        st.plotly_chart(fig, use_container_width=True)
-
-def show_system_search(explorer):
-    st.header("🔍 Water System Search")
-    
-    # Search filters
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        search_term = st.text_input("Search by System Name or PWSID:")
-        system_type = st.selectbox("System Type:", 
-                                  ["", "CWS", "TNCWS", "NTNCWS"])
-    
-    with col2:
-        min_pop = st.number_input("Minimum Population Served:", min_value=0, value=0)
-        max_pop = st.number_input("Maximum Population Served:", min_value=0, value=1000000)
-    
-    # Search button
-    if st.button("Search Systems"):
-        results = explorer.search_systems(search_term, system_type, min_pop, max_pop)
+    if search_button and search_input:
+        systems = explorer.find_my_water_system(search_input)
         
-        if not results.empty:
-            st.subheader(f"Found {len(results)} systems")
+        if not systems.empty:
+            st.success(f"Found {len(systems)} water system(s) in your area:")
             
-            # Make the dataframe interactive
-            st.dataframe(
-                results,
-                column_config={
-                    "PWSID": "System ID",
-                    "PWS_NAME": "System Name",
-                    "PWS_TYPE_CODE": "Type",
-                    "POPULATION_SERVED_COUNT": st.column_config.NumberColumn(
-                        "Population Served",
-                        format="%d"
-                    ),
-                    "CITY_NAME": "City",
-                    "STATE_CODE": "State"
-                },
-                use_container_width=True
-            )
+            for idx, system in systems.iterrows():
+                with st.expander(f"🏢 {system['PWS_NAME']} (PWSID: {system['PWSID']})"):
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        st.write(f"**Type:** {get_system_type_description(system['PWS_TYPE_CODE'])}")
+                        st.write(f"**Serves:** {system['POPULATION_SERVED_COUNT']:,.0f} people")
+                        st.write(f"**Location:** {system['CITY_NAME']}, {system['COUNTY_SERVED']} County")
+                    
+                    with col2:
+                        if st.button(f"View Safety Report", key=f"safety_{system['PWSID']}"):
+                            show_water_safety_report(explorer, system['PWSID'], system['PWS_NAME'])
         else:
-            st.warning("No systems found matching your criteria.")
+            st.warning("No water systems found. Try a different search term.")
+    
+    # Educational content
+    st.subheader("📚 Understanding Your Water Quality")
+    
+    tab1, tab2, tab3 = st.tabs(["Common Contaminants", "Violation Types", "What You Can Do"])
+    
+    with tab1:
+        show_contaminant_education(explorer)
+    
+    with tab2:
+        show_violation_education(explorer)
+    
+    with tab3:
+        show_action_guidance()
 
-def show_violations_analysis(explorer):
-    st.header("⚠️ Violations Analysis")
+def show_water_safety_report(explorer, pwsid, system_name):
+    st.subheader(f"🛡️ Water Safety Report: {system_name}")
     
-    # Violations by type
-    violations_by_type = explorer.get_violations_by_type()
+    safety_data = explorer.get_system_safety_summary(pwsid)
     
-    if not violations_by_type.empty:
-        col1, col2 = st.columns(2)
+    if safety_data['basic_info'].empty:
+        st.error("System information not found.")
+        return
+    
+    system_info = safety_data['basic_info'].iloc[0]
+    
+    # Safety status indicator
+    recent_violations = safety_data['recent_violations']
+    health_violations = recent_violations[recent_violations['IS_HEALTH_BASED_IND'] == 'Y'] if not recent_violations.empty else pd.DataFrame()
+    
+    if health_violations.empty:
+        st.success("✅ No recent health-based violations found")
+        safety_color = "green"
+    else:
+        unresolved_health = health_violations[health_violations['VIOLATION_STATUS'].isin(['Unaddressed', 'Addressed'])]
+        if not unresolved_health.empty:
+            st.error("⚠️ Active health-based violations found")
+            safety_color = "red"
+        else:
+            st.warning("⚡ Recent health-based violations (resolved)")
+            safety_color = "orange"
+    
+    # System details
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**System Information:**")
+        st.write(f"• Type: {get_system_type_description(system_info['PWS_TYPE_CODE'])}")
+        st.write(f"• Population Served: {system_info['POPULATION_SERVED_COUNT']:,.0f}")
+        st.write(f"• Water Source: {get_source_description(system_info['PRIMARY_SOURCE_CODE'])}")
+        st.write(f"• Contact: {system_info['PHONE_NUMBER']}")
+    
+    with col2:
+        st.write("**Recent Activity:**")
+        if not recent_violations.empty:
+            st.write(f"• Total violations (2 years): {len(recent_violations)}")
+            st.write(f"• Health-based violations: {len(health_violations)}")
+        else:
+            st.write("• No recent violations")
+    
+    # Recent violations details
+    if not recent_violations.empty:
+        st.subheader("Recent Violations (Last 2 Years)")
         
-        with col1:
-            fig = px.bar(violations_by_type, x='count', y='VIOLATION_CATEGORY_CODE',
-                        orientation='h', title="Violations by Category")
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            # Health-based violations analysis
-            health_violations_query = """
-            SELECT IS_HEALTH_BASED_IND, COUNT(*) as count
-            FROM violations_enforcement
-            WHERE IS_HEALTH_BASED_IND IS NOT NULL
-            GROUP BY IS_HEALTH_BASED_IND
-            """
-            health_violations = explorer.execute_query(health_violations_query)
+        for idx, violation in recent_violations.iterrows():
+            severity = "🔴" if violation['IS_HEALTH_BASED_IND'] == 'Y' else "🟡"
+            status_color = "red" if violation['VIOLATION_STATUS'] in ['Unaddressed', 'Addressed'] else "green"
             
-            if not health_violations.empty:
-                fig = px.pie(health_violations, values='count', names='IS_HEALTH_BASED_IND',
-                           title="Health-Based vs Non-Health-Based Violations")
-                st.plotly_chart(fig, use_container_width=True)
-    
-    # Top violators
-    st.subheader("Systems with Most Violations")
-    top_violators_query = """
-    SELECT v.PWSID, p.PWS_NAME, COUNT(*) as violation_count,
-           p.POPULATION_SERVED_COUNT, p.PWS_TYPE_CODE
-    FROM violations_enforcement v
-    JOIN pub_water_systems p ON v.PWSID = p.PWSID
-    GROUP BY v.PWSID, p.PWS_NAME, p.POPULATION_SERVED_COUNT, p.PWS_TYPE_CODE
-    ORDER BY violation_count DESC
-    LIMIT 20
-    """
-    top_violators = explorer.execute_query(top_violators_query)
-    
-    if not top_violators.empty:
-        st.dataframe(top_violators, use_container_width=True)
+            with st.expander(f"{severity} {violation['VIOLATION_CATEGORY_CODE']} - {violation['CONTAMINANT_CODE']} ({violation['VIOLATION_STATUS']})"):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write(f"**Started:** {violation['NON_COMPL_PER_BEGIN_DATE']}")
+                    if violation['NON_COMPL_PER_END_DATE']:
+                        st.write(f"**Resolved:** {violation['NON_COMPL_PER_END_DATE']}")
+                    st.write(f"**Status:** {violation['VIOLATION_STATUS']}")
+                
+                with col2:
+                    # Show health information if available
+                    contaminant_info = explorer.get_contaminant_health_info().get(violation['CONTAMINANT_CODE'])
+                    if contaminant_info:
+                        st.write(f"**Health Effects:** {contaminant_info['health_effects']}")
+                        st.write(f"**Severity:** {contaminant_info['severity']}")
 
-def show_geographic_view(explorer):
-    st.header("🗺️ Geographic Distribution")
+def show_operator_interface(explorer):
+    st.header("🔧 Water System Operator Dashboard")
+    st.markdown("### Manage your water system compliance and operations")
     
-    # Systems by county
-    systems_by_county = explorer.get_systems_by_county()
-    
-    if not systems_by_county.empty:
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            fig = px.bar(systems_by_county.head(15), 
-                        x='system_count', y='COUNTY_SERVED',
-                        orientation='h', title="Top 15 Counties by Number of Systems")
-            st.plotly_chart(fig, use_container_width=True)
-        
-        with col2:
-            fig = px.scatter(systems_by_county, 
-                           x='system_count', y='avg_population',
-                           hover_data=['COUNTY_SERVED'],
-                           title="Systems Count vs Average Population by County")
-            st.plotly_chart(fig, use_container_width=True)
-    
-    # Simple map (you would enhance this with actual coordinates)
-    st.subheader("Water Systems Map")
-    st.info("Map functionality would be enhanced with actual coordinate data for each system.")
-
-def show_system_details(explorer):
-    st.header("🏢 System Details")
-    
-    # PWSID input
-    pwsid = st.text_input("Enter PWSID (e.g., GA0000001):")
+    # System selection
+    pwsid = st.text_input("Enter your PWSID:", placeholder="e.g., GA0000001")
     
     if pwsid:
-        details = explorer.get_system_details(pwsid)
+        operator_data = explorer.get_operator_dashboard(pwsid)
         
-        if not details['basic_info'].empty:
-            system_info = details['basic_info'].iloc[0]
+        if operator_data['system_info'].empty:
+            st.error("System not found. Please check your PWSID.")
+            return
+        
+        system_info = operator_data['system_info'].iloc[0]
+        st.success(f"Welcome, {system_info['PWS_NAME']} operator!")
+        
+        # Dashboard tabs
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "🏠 Overview", "⚠️ Active Issues", "📅 Compliance Calendar", 
+            "🏭 Facilities", "📊 Reports"
+        ])
+        
+        with tab1:
+            show_operator_overview(operator_data, system_info)
+        
+        with tab2:
+            show_operator_violations(operator_data)
+        
+        with tab3:
+            show_compliance_calendar(explorer, pwsid)
+        
+        with tab4:
+            show_operator_facilities(operator_data)
+        
+        with tab5:
+            show_operator_reports(operator_data, system_info)
+
+def show_operator_overview(operator_data, system_info):
+    st.subheader("System Overview")
+    
+    # Key metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    active_violations = len(operator_data['active_violations'])
+    health_violations = len(operator_data['active_violations'][
+        operator_data['active_violations']['IS_HEALTH_BASED_IND'] == 'Y'
+    ]) if not operator_data['active_violations'].empty else 0
+    
+    with col1:
+        st.metric("Population Served", f"{system_info['POPULATION_SERVED_COUNT']:,.0f}")
+    
+    with col2:
+        st.metric("Service Connections", f"{system_info['SERVICE_CONNECTIONS_COUNT']:,.0f}")
+    
+    with col3:
+        color = "red" if active_violations > 0 else "green"
+        st.metric("Active Violations", active_violations)
+    
+    with col4:
+        color = "red" if health_violations > 0 else "green"
+        st.metric("Health-Based Violations", health_violations)
+    
+    # System details
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("System Information")
+        st.write(f"**PWSID:** {system_info['PWSID']}")
+        st.write(f"**Type:** {get_system_type_description(system_info['PWS_TYPE_CODE'])}")
+        st.write(f"**Primary Source:** {get_source_description(system_info['PRIMARY_SOURCE_CODE'])}")
+        st.write(f"**Owner Type:** {system_info['OWNER_TYPE_CODE']}")
+        st.write(f"**Status:** {system_info['PWS_ACTIVITY_CODE']}")
+    
+    with col2:
+        st.subheader("Contact Information")
+        st.write(f"**Admin Contact:** {system_info['ADMIN_NAME']}")
+        st.write(f"**Phone:** {system_info['PHONE_NUMBER']}")
+        st.write(f"**Email:** {system_info['EMAIL_ADDR']}")
+        st.write(f"**Address:** {system_info['ADDRESS_LINE1']}")
+        st.write(f"**City:** {system_info['CITY_NAME']}, {system_info['STATE_CODE']} {system_info['ZIP_CODE']}")
+
+def show_operator_violations(operator_data):
+    st.subheader("Active Violations & Issues")
+    
+    active_violations = operator_data['active_violations']
+    
+    if active_violations.empty:
+        st.success("🎉 No active violations! Your system is in compliance.")
+        return
+    
+    # Priority violations (health-based)
+    health_violations = active_violations[active_violations['IS_HEALTH_BASED_IND'] == 'Y']
+    
+    if not health_violations.empty:
+        st.error("🚨 PRIORITY: Health-Based Violations Require Immediate Attention")
+        
+        for idx, violation in health_violations.iterrows():
+            with st.expander(f"🔴 {violation['VIOLATION_CATEGORY_CODE']} - {violation['CONTAMINANT_CODE']}", expanded=True):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write(f"**Violation ID:** {violation['VIOLATION_ID']}")
+                    st.write(f"**Started:** {violation['NON_COMPL_PER_BEGIN_DATE']}")
+                    st.write(f"**Status:** {violation['VIOLATION_STATUS']}")
+                    
+                with col2:
+                    st.write("**Required Actions:**")
+                    st.write("• Contact your primacy agency immediately")
+                    st.write("• Issue public notification if required")
+                    st.write("• Implement corrective measures")
+                    
+                    if violation['PUBLIC_NOTIFICATION_TIER']:
+                        st.write(f"**Public Notice Tier:** {violation['PUBLIC_NOTIFICATION_TIER']}")
+    
+    # Other violations
+    other_violations = active_violations[active_violations['IS_HEALTH_BASED_IND'] != 'Y']
+    
+    if not other_violations.empty:
+        st.warning("📋 Other Active Violations")
+        
+        for idx, violation in other_violations.iterrows():
+            with st.expander(f"🟡 {violation['VIOLATION_CATEGORY_CODE']} - {violation['CONTAMINANT_CODE']}"):
+                st.write(f"**Started:** {violation['NON_COMPL_PER_BEGIN_DATE']}")
+                st.write(f"**Status:** {violation['VIOLATION_STATUS']}")
+                st.write(f"**Category:** {violation['VIOLATION_CATEGORY_CODE']}")
+
+def show_compliance_calendar(explorer, pwsid):
+    st.subheader("Compliance Calendar")
+    
+    calendar_data = explorer.get_compliance_calendar(pwsid)
+    
+    if calendar_data.empty:
+        st.info("No upcoming compliance requirements found.")
+        return
+    
+    # Upcoming deadlines
+    upcoming = calendar_data[calendar_data['EVENT_END_DATE'] >= datetime.now().strftime('%Y-%m-%d')]
+    
+    if not upcoming.empty:
+        st.warning("⏰ Upcoming Deadlines")
+        
+        for idx, event in upcoming.iterrows():
+            days_until = (pd.to_datetime(event['EVENT_END_DATE']) - datetime.now()).days
             
-            # Basic information
-            st.subheader("Basic Information")
+            if days_until <= 30:
+                urgency = "🔴" if days_until <= 7 else "🟡"
+            else:
+                urgency = "🟢"
+            
+            with st.expander(f"{urgency} {event['EVENT_MILESTONE_CODE']} - Due: {event['EVENT_END_DATE']} ({days_until} days)"):
+                st.write(f"**Event:** {event['EVENT_MILESTONE_CODE']}")
+                st.write(f"**Reason:** {event['EVENT_REASON_CODE']}")
+                if event['EVENT_COMMENTS_TEXT']:
+                    st.write(f"**Details:** {event['EVENT_COMMENTS_TEXT']}")
+                
+                if event['EVENT_ACTUAL_DATE']:
+                    st.success(f"✅ Completed on: {event['EVENT_ACTUAL_DATE']}")
+
+def show_operator_facilities(operator_data):
+    st.subheader("System Facilities")
+    
+    facilities = operator_data['facilities']
+    
+    if facilities.empty:
+        st.info("No facility information available.")
+        return
+    
+    # Group by facility type
+    facility_types = facilities['FACILITY_TYPE_CODE'].unique()
+    
+    for facility_type in facility_types:
+        type_facilities = facilities[facilities['FACILITY_TYPE_CODE'] == facility_type]
+        
+        with st.expander(f"🏭 {facility_type} Facilities ({len(type_facilities)})"):
+            for idx, facility in type_facilities.iterrows():
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write(f"**Name:** {facility['FACILITY_NAME']}")
+                    st.write(f"**ID:** {facility['FACILITY_ID']}")
+                    st.write(f"**Status:** {facility['FACILITY_ACTIVITY_CODE']}")
+                
+                with col2:
+                    st.write(f"**Type:** {facility['FACILITY_TYPE_CODE']}")
+                    if facility['WATER_TYPE_CODE']:
+                        st.write(f"**Water Type:** {facility['WATER_TYPE_CODE']}")
+                    if facility['IS_SOURCE_IND'] == 'Y':
+                        st.write("**Source Facility:** Yes")
+
+def show_operator_reports(operator_data, system_info):
+    st.subheader("System Reports")
+    
+    # Generate compliance summary
+    active_violations = operator_data['active_violations']
+    recent_inspections = operator_data['recent_inspections']
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**Compliance Summary:**")
+        if active_violations.empty:
+            st.success("✅ System is in full compliance")
+        else:
+            st.error(f"❌ {len(active_violations)} active violations")
+            
+            violation_types = active_violations['VIOLATION_CATEGORY_CODE'].value_counts()
+            for vtype, count in violation_types.items():
+                st.write(f"• {vtype}: {count}")
+    
+    with col2:
+        st.write("**Recent Inspection Summary:**")
+        if not recent_inspections.empty:
+            latest_inspection = recent_inspections.iloc[0]
+            st.write(f"**Last Inspection:** {latest_inspection['VISIT_DATE']}")
+            st.write(f"**Reason:** {latest_inspection['VISIT_REASON_CODE']}")
+            st.write(f"**Compliance Result:** {latest_inspection['COMPLIANCE_EVAL_CODE']}")
+        else:
+            st.info("No recent inspections found")
+
+def show_regulator_interface(explorer):
+    st.header("🏛️ Regulator Field Kit")
+    st.markdown("### Quick access to system information for inspections and oversight")
+    
+    # Quick system lookup
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        pwsid = st.text_input("Enter PWSID for field inspection:", placeholder="GA0000001")
+    
+    with col2:
+        if st.button("Load System", type="primary"):
+            if pwsid:
+                show_regulator_field_kit(explorer, pwsid)
+    
+    # Regional overview
+    st.subheader("🗺️ Regional Overview")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        county = st.selectbox("Select County:", ["All Counties"] + get_georgia_counties())
+    
+    with col2:
+        if st.button("Load Regional Data"):
+            county_filter = None if county == "All Counties" else county
+            show_regional_overview(explorer, county_filter)
+
+def show_regulator_field_kit(explorer, pwsid):
+    st.subheader(f"🔍 Field Kit: {pwsid}")
+    
+    field_data = explorer.get_regulator_field_kit(pwsid)
+    
+    if field_data['system_snapshot'].empty:
+        st.error("System not found.")
+        return
+    
+    system = field_data['system_snapshot'].iloc[0]
+    
+    # Quick status indicators
+    col1, col2, col3, col4 = st.columns(4)
+    
+    violation_summary = field_data['violation_summary']
+    total_violations = violation_summary['count'].sum() if not violation_summary.empty else 0
+    health_violations = violation_summary['health_based_count'].sum() if not violation_summary.empty else 0
+    
+    with col1:
+        st.metric("Population", f"{system['POPULATION_SERVED_COUNT']:,.0f}")
+    
+    with col2:
+        color = "red" if total_violations > 0 else "green"
+        st.metric("Total Violations", total_violations)
+    
+    with col3:
+        color = "red" if health_violations > 0 else "green"
+        st.metric("Health Violations", health_violations)
+    
+    with col4:
+        recent_inspections = field_data['inspection_history']
+        last_inspection = recent_inspections.iloc[0]['VISIT_DATE'] if not recent_inspections.empty else "None"
+        st.metric("Last Inspection", last_inspection)
+    
+    # System snapshot
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("System Snapshot")
+        st.write(f"**Name:** {system['PWS_NAME']}")
+        st.write(f"**Type:** {get_system_type_description(system['PWS_TYPE_CODE'])}")
+        st.write(f"**Source:** {get_source_description(system['PRIMARY_SOURCE_CODE'])}")
+        st.write(f"**Owner:** {system['OWNER_TYPE_CODE']}")
+        st.write(f"**Connections:** {system['SERVICE_CONNECTIONS_COUNT']:,.0f}")
+        
+        st.subheader("Contact")
+        st.write(f"**Admin:** {system['ADMIN_NAME']}")
+        st.write(f"**Phone:** {system['PHONE_NUMBER']}")
+        st.write(f"**Location:** {system['CITY_NAME']}")
+    
+    with col2:
+        st.subheader("Compliance Status")
+        
+        if not violation_summary.empty:
+            for idx, vtype in violation_summary.iterrows():
+                severity = "🔴" if vtype['health_based_count'] > 0 else "🟡"
+                st.write(f"{severity} **{vtype['VIOLATION_CATEGORY_CODE']}:** {vtype['count']} total, {vtype['health_based_count']} health-based")
+        else:
+            st.success("✅ No violations on record")
+        
+        st.subheader("Enforcement History")
+        enforcement = field_data['enforcement_history']
+        if not enforcement.empty:
+            for idx, action in enforcement.head(3).iterrows():
+                st.write(f"• {action['ENFORCEMENT_DATE']}: {action['ENFORCEMENT_ACTION_TYPE_CODE']}")
+        else:
+            st.info("No enforcement actions")
+    
+    # Detailed tabs for field reference
+    tab1, tab2, tab3 = st.tabs(["📋 Violations Detail", "🔍 Inspection History", "⚖️ Enforcement"])
+    
+    with tab1:
+        if not violation_summary.empty:
+            st.dataframe(violation_summary, use_container_width=True)
+        else:
+            st.info("No violations found")
+    
+    with tab2:
+        inspections = field_data['inspection_history']
+        if not inspections.empty:
+            st.dataframe(inspections, use_container_width=True)
+        else:
+            st.info("No inspection history found")
+    
+    with tab3:
+        enforcement = field_data['enforcement_history']
+        if not enforcement.empty:
+            st.dataframe(enforcement, use_container_width=True)
+        else:
+            st.info("No enforcement history found")
+
+def show_regional_overview(explorer, county):
+    st.subheader(f"Regional Overview: {county or 'All Counties'}")
+    
+    regional_data = explorer.get_regional_overview(county)
+    
+    if regional_data.empty:
+        st.warning("No data found for selected region.")
+        return
+    
+    # Summary metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    total_systems = len(regional_data)
+    total_population = regional_data['POPULATION_SERVED_COUNT'].sum()
+    systems_with_violations = len(regional_data[regional_data['total_violations'] > 0])
+    systems_with_health_violations = len(regional_data[regional_data['health_violations'] > 0])
+    
+    with col1:
+        st.metric("Total Systems", total_systems)
+    
+    with col2:
+        st.metric("Population Served", f"{total_population:,.0f}")
+    
+    with col3:
+        st.metric("Systems w/ Violations", f"{systems_with_violations} ({systems_with_violations/total_systems*100:.1f}%)")
+    
+    with col4:
+        st.metric("Health Violations", f"{systems_with_health_violations} ({systems_with_health_violations/total_systems*100:.1f}%)")
+    
+    # Priority systems (those with health violations)
+    priority_systems = regional_data[regional_data['health_violations'] > 0].head(10)
+    
+    if not priority_systems.empty:
+        st.subheader("🚨 Priority Systems (Health Violations)")
+        
+        for idx, system in priority_systems.iterrows():
+            with st.expander(f"🔴 {system['PWS_NAME']} - {system['health_violations']} health violations"):
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.write(f"**PWSID:** {system['PWSID']}")
+                    st.write(f"**Population:** {system['POPULATION_SERVED_COUNT']:,.0f}")
+                    st.write(f"**Type:** {system['PWS_TYPE_CODE']}")
+                
+                with col2:
+                    st.write(f"**Total Violations:** {system['total_violations']}")
+                    st.write(f"**Health Violations:** {system['health_violations']}")
+                    st.write(f"**Last Inspection:** {system['last_inspection'] or 'None'}")
+    
+    # Systems overview table
+    st.subheader("All Systems Overview")
+    
+    # Add risk scoring
+    regional_data['risk_score'] = (
+        regional_data['health_violations'] * 3 + 
+        regional_data['total_violations'] * 1 +
+        regional_data['POPULATION_SERVED_COUNT'] / 10000
+    )
+    
+    display_data = regional_data[['PWS_NAME', 'PWS_TYPE_CODE', 'POPULATION_SERVED_COUNT', 
+                                 'total_violations', 'health_violations', 'last_inspection', 'risk_score']].copy()
+    
+    display_data = display_data.sort_values('risk_score', ascending=False)
+    
+    st.dataframe(
+        display_data,
+        column_config={
+            "PWS_NAME": "System Name",
+            "PWS_TYPE_CODE": "Type",
+            "POPULATION_SERVED_COUNT": st.column_config.NumberColumn("Population", format="%d"),
+            "total_violations": "Total Violations",
+            "health_violations": "Health Violations",
+            "last_inspection": "Last Inspection",
+            "risk_score": st.column_config.NumberColumn("Risk Score", format="%.1f")
+        },
+        use_container_width=True
+    )
+
+# Helper functions
+def get_system_type_description(code):
+    descriptions = {
+        'CWS': 'Community Water System (serves residents year-round)',
+        'TNCWS': 'Transient Non-Community (serves travelers/visitors)',
+        'NTNCWS': 'Non-Transient Non-Community (serves workers/students)'
+    }
+    return descriptions.get(code, code)
+
+def get_source_description(code):
+    descriptions = {
+        'GW': 'Groundwater (wells, springs)',
+        'SW': 'Surface Water (rivers, lakes)',
+        'GWP': 'Purchased Groundwater',
+        'SWP': 'Purchased Surface Water',
+        'GU': 'Groundwater Under Surface Water Influence',
+        'GUP': 'Purchased Groundwater Under Surface Water Influence'
+    }
+    return descriptions.get(code, code)
+
+def get_georgia_counties():
+    # Simplified list - in production, this would come from the database
+    return [
+        'FULTON', 'DEKALB', 'GWINNETT', 'COBB', 'CLAYTON', 'HENRY', 'CHEROKEE',
+        'FORSYTH', 'HALL', 'MUSCOGEE', 'BIBB', 'RICHMOND', 'CHATHAM', 'CLARKE'
+    ]
+
+def show_contaminant_education(explorer):
+    st.write("### Common Contaminants and Health Effects")
+    
+    contaminant_info = explorer.get_contaminant_health_info()
+    
+    for contaminant, info in contaminant_info.items():
+        with st.expander(f"🧪 {contaminant}"):
             col1, col2 = st.columns(2)
             
             with col1:
-                st.write(f"**System Name:** {system_info['PWS_NAME']}")
-                st.write(f"**Type:** {system_info['PWS_TYPE_CODE']}")
-                st.write(f"**Population Served:** {system_info['POPULATION_SERVED_COUNT']:,.0f}")
-                st.write(f"**Activity Status:** {system_info['PWS_ACTIVITY_CODE']}")
+                st.write(f"**Health Effects:** {info['health_effects']}")
+                st.write(f"**Common Sources:** {info['sources']}")
             
             with col2:
-                st.write(f"**City:** {system_info['CITY_NAME']}")
-                st.write(f"**Owner Type:** {system_info['OWNER_TYPE_CODE']}")
-                st.write(f"**Primary Source:** {system_info['PRIMARY_SOURCE_CODE']}")
-                st.write(f"**Service Connections:** {system_info['SERVICE_CONNECTIONS_COUNT']}")
+                st.write(f"**Action Level:** {info['action_level']}")
+                severity_color = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}
+                st.write(f"**Severity:** {severity_color.get(info['severity'], '🟡')} {info['severity']}")
+
+def show_violation_education(explorer):
+    st.write("### Understanding Violation Types")
+    
+    violation_info = explorer.get_violation_explanations()
+    
+    for violation_type, explanation in violation_info.items():
+        with st.expander(f"📋 {violation_type}"):
+            st.write(explanation)
             
-            # Violations
-            if not details['violations'].empty:
-                st.subheader("Violations")
-                st.dataframe(details['violations'][['VIOLATION_CODE', 'VIOLATION_CATEGORY_CODE', 
-                                                  'NON_COMPL_PER_BEGIN_DATE', 'VIOLATION_STATUS']], 
-                           use_container_width=True)
-            
-            # Facilities
-            if not details['facilities'].empty:
-                st.subheader("Facilities")
-                st.dataframe(details['facilities'][['FACILITY_NAME', 'FACILITY_TYPE_CODE', 
-                                                  'FACILITY_ACTIVITY_CODE', 'WATER_TYPE_CODE']], 
-                           use_container_width=True)
-            
-            # Site visits
-            if not details['site_visits'].empty:
-                st.subheader("Recent Site Visits")
-                st.dataframe(details['site_visits'][['VISIT_DATE', 'VISIT_REASON_CODE', 
-                                                   'COMPLIANCE_EVAL_CODE']], 
-                           use_container_width=True)
-        else:
-            st.error("System not found. Please check the PWSID.")
+            if violation_type in ['MCL', 'MRDL', 'TT']:
+                st.warning("⚠️ This is a health-based violation that requires immediate attention.")
+
+def show_action_guidance():
+    st.write("### What You Can Do")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.write("**If You Find Violations:**")
+        st.write("• Contact your water system directly")
+        st.write("• Ask about corrective actions being taken")
+        st.write("• Request public notifications")
+        st.write("• Consider temporary alternatives if health-based")
+        
+        st.write("**Stay Informed:**")
+        st.write("• Sign up for water system notifications")
+        st.write("• Review annual water quality reports")
+        st.write("• Attend public meetings")
+    
+    with col2:
+        st.write("**Additional Resources:**")
+        st.write("• [EPA Safe Drinking Water Hotline](tel:1-800-426-4791): 1-800-426-4791")
+        st.write("• [Georgia EPD](https://epd.georgia.gov/)")
+        st.write("• [CDC Water Quality Information](https://www.cdc.gov/healthywater/)")
+        
+        st.write("**Emergency Contacts:**")
+        st.write("• Local Health Department")
+        st.write("• Georgia Environmental Protection Division")
+        st.write("• EPA Region 4: 1-800-241-1754")
 
 if __name__ == "__main__":
     main()
