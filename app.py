@@ -61,12 +61,13 @@ class WaterSystemExplorer:
             # Get database schema information
             schema_info = self._get_database_schema()
             
-            prompt = f"""You are a SQL expert specializing in water safety data analysis.
-            
-Database Schema:
-{schema_info}
+            # Use string concatenation to avoid f-string formatting issues
+            prompt = """You are a SQL expert specializing in water safety data analysis for Georgia drinking water systems.
 
-Natural Language Query: {natural_language_query}
+Database Schema:
+""" + schema_info + """
+
+Natural Language Query: """ + natural_language_query + """
 
 Generate a SQL query that answers the user's question. The query should:
 1. Be safe and read-only (SELECT statements only)
@@ -74,14 +75,51 @@ Generate a SQL query that answers the user's question. The query should:
 3. Include relevant columns for water safety analysis
 4. Limit results to a reasonable number (e.g., LIMIT 100)
 5. Return results that can be displayed in a water safety context
+6. Use proper SQLite syntax and functions
 
-Important tables:
-- pub_water_systems: Basic water system information
-- violations_enforcement: Violation records
-- lcr_samples: Test results
-- geographic_areas: Location information
+Important tables and their relationships:
+- pub_water_systems (p): Basic water system information (PWSID is primary key)
+- violations_enforcement (v): Violation records (linked by PWSID)
+- lcr_samples (l): Test results (linked by PWSID)
+- geographic_areas (g): Location information (linked by PWSID)
 
-Return ONLY the SQL query without any explanation or formatting."""
+Common patterns and example queries to reference:
+
+1. Find water systems by location:
+SELECT DISTINCT p.PWSID, p.PWS_NAME, p.PWS_TYPE_CODE, p.POPULATION_SERVED_COUNT,
+       p.CITY_NAME, g.COUNTY_SERVED, g.ZIP_CODE_SERVED
+FROM pub_water_systems p
+LEFT JOIN geographic_areas g ON p.PWSID = g.PWSID
+WHERE p.PWS_ACTIVITY_CODE = 'A' AND (
+    UPPER(p.CITY_NAME) LIKE UPPER('%Atlanta%') OR
+    UPPER(g.COUNTY_SERVED) LIKE UPPER('%Fulton%') OR
+    g.ZIP_CODE_SERVED LIKE '30309%'
+)
+ORDER BY p.POPULATION_SERVED_COUNT DESC;
+
+2. Get violations for analysis:
+SELECT p.PWS_NAME, p.CITY_NAME, v.VIOLATION_CATEGORY_CODE, v.CONTAMINANT_CODE,
+       v.NON_COMPL_PER_BEGIN_DATE, v.IS_HEALTH_BASED_IND, v.VIOLATION_STATUS
+FROM violations_enforcement v
+JOIN pub_water_systems p ON v.PWSID = p.PWSID
+WHERE v.NON_COMPL_PER_BEGIN_DATE >= date('now', '-2 years')
+ORDER BY v.NON_COMPL_PER_BEGIN_DATE DESC;
+
+3. Get test results:
+SELECT p.PWS_NAME, p.CITY_NAME, l.CONTAMINANT_CODE, l.SAMPLE_MEASURE, 
+       l.UNIT_OF_MEASURE, l.SAMPLING_END_DATE
+FROM lcr_samples l
+JOIN pub_water_systems p ON l.PWSID = p.PWSID
+ORDER BY l.SAMPLING_END_DATE DESC
+LIMIT 50;
+
+Key field values to remember:
+- PWS_ACTIVITY_CODE = 'A' for active systems
+- IS_HEALTH_BASED_IND = 'Y' for health-based violations
+- Common CONTAMINANT_CODEs: LEAD, COPPER, COLIFORM, NITRATE
+- Date functions: date('now', '-2 years') for recent data
+
+Return ONLY the SQL query without any explanation, formatting, or code blocks."""
 
             response = self.azure_client_low.chat.completions.create(
                 model=os.getenv('AZURE_OPENAI_DEPLOYMENT_NAME_2'),
@@ -421,6 +459,7 @@ class UIComponents:
                             temperature=0.1
                         )
                         
+                        print(response)
                         query_type, processed_query = _parse_response_for_query_type_and_query(response)
                         print("parsed response")
                         print(query_type)
@@ -776,6 +815,14 @@ def _parse_response_for_query_type_and_query(response):
     try:
         content = response.choices[0].message.content.strip()
         
+        # Remove markdown code block formatting if present
+        if content.startswith('```json'):
+            content = content.replace('```json', '').replace('```', '')
+        elif content.startswith('```'):
+            content = content.replace('```', '')
+        
+        content = content.strip()
+        
         # Try to parse as JSON
         try:
             data = json.loads(content)
@@ -787,16 +834,25 @@ def _parse_response_for_query_type_and_query(response):
             query = ''
             
             for line in lines:
-                if 'query_type' in line.lower():
-                    if 'query' in line.lower() and 'location' not in line.lower():
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                # Look for query_type
+                if '"query_type"' in line:
+                    if '"query"' in line and '"location"' not in line:
                         query_type = 'query'
-                    else:
+                    elif '"location"' in line:
                         query_type = 'location'
-                elif 'query' in line.lower() and '"' in line:
-                    # Extract query from quoted text
-                    parts = line.split('"')
-                    if len(parts) >= 2:
-                        query = parts[1]
+                
+                # Look for query value
+                elif '"query"' in line and ':' in line:
+                    # Extract the value after the colon
+                    parts = line.split(':', 1)
+                    if len(parts) == 2:
+                        query_part = parts[1].strip()
+                        # Remove quotes and comma
+                        query = query_part.strip('"').strip(',').strip()
             
             return query_type, query
             
