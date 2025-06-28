@@ -84,7 +84,6 @@ class WaterSystemExplorer:
     def _init_azure_openai(self, model_type: str="high"):
         """Initialize Azure OpenAI client"""
         try:
-            # Fall back to environment variables
             if model_type == "high":
                 api_key = os.getenv('AZURE_OPENAI_API_KEY')
                 endpoint = os.getenv('AZURE_OPENAI_ENDPOINT')
