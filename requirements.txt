@@ -1,0 +1,7 @@
+pandas
+sqlalchemy
+duckdb-engine         # ≈20× faster CSV ingestion (then we copy to SQLite)
+sqlite-utils          # nicer FTS / indexes
+streamlit
+pydeck                # map layer for Streamlit
+geopandas             # to join county shapefiles (optional but pre-wired)
