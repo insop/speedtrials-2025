@@ -141,7 +141,8 @@ class UIComponents:
             SafetyReportGenerator.show_safety_report(
                 explorer, 
                 st.session_state.selected_system['pwsid'], 
-                st.session_state.selected_system['name']
+                st.session_state.selected_system['name'],
+                summary_txt="This is a summary of the safety report"
             )
             
             # Add button to clear the report
@@ -214,7 +215,7 @@ class SafetyReportGenerator:
     """Generates water safety reports"""
     
     @staticmethod
-    def show_safety_report(explorer, pwsid, system_name):
+    def show_safety_report(explorer, pwsid, system_name, summary_txt=None):
         """Display comprehensive safety report"""
         st.title(f"🛡️ Water Safety Report")
         st.subheader(f"{system_name}")
@@ -231,6 +232,12 @@ class SafetyReportGenerator:
             return
         
         system_info = safety_data['basic_info'].iloc[0]
+        
+        # Generate and show summary section
+        if summary_txt is None:
+            summary_txt = SafetyReportGenerator._generate_summary(safety_data, system_info)
+        
+        SafetyReportGenerator._show_summary_section(summary_txt, safety_data, system_info)
         
         # Show safety status
         SafetyReportGenerator._show_safety_status(safety_data['recent_violations'])
@@ -410,6 +417,76 @@ class SafetyReportGenerator:
         st.write("• Georgia EPD: 1-888-373-5947")
         st.write("• EPA Safe Drinking Water Hotline: 1-800-426-4791")
         st.write(f"• Your Water System: {system_info.get('PHONE_NUMBER', 'Contact information not available')}")
+    
+    @staticmethod
+    def _generate_summary(safety_data, system_info):
+        """Generate a summary of the water system's safety status"""
+        violations_df = safety_data['recent_violations']
+        test_results_df = safety_data['test_results']
+        
+        # Count violations
+        total_violations = len(violations_df)
+        health_violations = len(violations_df[violations_df['IS_HEALTH_BASED_IND'] == 'Y']) if not violations_df.empty else 0
+        unresolved_health = len(violations_df[
+            (violations_df['IS_HEALTH_BASED_IND'] == 'Y') & 
+            (violations_df['VIOLATION_STATUS'].isin(['Unaddressed', 'Addressed']))
+        ]) if not violations_df.empty else 0
+        
+        # Generate population info
+        population = int(system_info.get('POPULATION_SERVED_COUNT', 0))
+        pop_text = f"{population:,} people" if population > 0 else "unknown number of people"
+        
+        # Generate summary text
+        if unresolved_health > 0:
+            summary = f"⚠️ **ATTENTION REQUIRED**: This water system serving {pop_text} currently has {unresolved_health} active health-based violation(s). Immediate action may be needed to ensure water safety."
+        elif health_violations > 0:
+            summary = f"📋 This water system serving {pop_text} has had {health_violations} health-based violation(s) in the past 2 years, but they appear to be resolved. Monitor for updates."
+        elif total_violations > 0:
+            summary = f"✅ This water system serving {pop_text} has good health compliance but has {total_violations} non-health monitoring/reporting violation(s) in the past 2 years."
+        else:
+            summary = f"✅ **GOOD NEWS**: This water system serving {pop_text} has no violations in the past 2 years and appears to be operating safely."
+        
+        # Add test results info if available
+        if not test_results_df.empty:
+            unique_contaminants = len(test_results_df['CONTAMINANT_CODE'].unique())
+            summary += f" Recent testing covers {unique_contaminants} different contaminant(s)."
+        
+        return summary
+    
+    @staticmethod
+    def _show_summary_section(summary_txt, safety_data, system_info):
+        """Display the summary section"""
+        st.subheader("📋 Safety Summary")
+        
+        # Determine the appropriate message type based on content
+        if "ATTENTION REQUIRED" in summary_txt or "⚠️" in summary_txt:
+            st.error(summary_txt)
+        elif "📋" in summary_txt and "violation" in summary_txt.lower():
+            st.warning(summary_txt)
+        else:
+            st.success(summary_txt)
+        
+        # Add quick stats
+        violations_df = safety_data['recent_violations']
+        if not violations_df.empty:
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Violations (2 years)", len(violations_df))
+            with col2:
+                health_violations = len(violations_df[violations_df['IS_HEALTH_BASED_IND'] == 'Y'])
+                st.metric("Health-Based Violations", health_violations)
+            with col3:
+                population = int(system_info.get('POPULATION_SERVED_COUNT', 0))
+                st.metric("Population Served", f"{population:,}")
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Violations (2 years)", "0", delta="No violations found")
+            with col2:
+                population = int(system_info.get('POPULATION_SERVED_COUNT', 0))
+                st.metric("Population Served", f"{population:,}")
+        
+        st.divider()
     
     @staticmethod
     def _show_error_guidance():
