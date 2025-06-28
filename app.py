@@ -264,6 +264,28 @@ def show_public_interface(explorer):
     st.header("💧 Is My Water Safe?")
     st.markdown("### Find information about your local water system and understand your water quality")
     
+    # Initialize session state for safety report display
+    if 'show_safety_report' not in st.session_state:
+        st.session_state.show_safety_report = False
+    if 'selected_pwsid' not in st.session_state:
+        st.session_state.selected_pwsid = None
+    if 'selected_system_name' not in st.session_state:
+        st.session_state.selected_system_name = None
+    
+    # Check if we should show a safety report
+    if st.session_state.show_safety_report and st.session_state.selected_pwsid:
+        # Display safety report
+        col1, col2 = st.columns([1, 4])
+        with col1:
+            if st.button("← Back to Search", type="secondary"):
+                st.session_state.show_safety_report = False
+                st.session_state.selected_pwsid = None
+                st.session_state.selected_system_name = None
+                st.rerun()
+        
+        show_water_safety_report(explorer, st.session_state.selected_pwsid, st.session_state.selected_system_name)
+        return  # Don't show the rest of the interface when displaying safety report
+    
     # Water system finder
     st.subheader("🔍 Find Your Water System")
     col1, col2 = st.columns([3, 1])
@@ -294,7 +316,10 @@ def show_public_interface(explorer):
                     
                     with col2:
                         if st.button(f"View Safety Report", key=f"safety_{system['PWSID']}"):
-                            show_water_safety_report(explorer, system['PWSID'], system['PWS_NAME'])
+                            st.session_state.show_safety_report = True
+                            st.session_state.selected_pwsid = system['PWSID']
+                            st.session_state.selected_system_name = system['PWS_NAME']
+                            st.experimental_rerun()
         else:
             st.warning("No water systems found. Try a different search term.")
     
